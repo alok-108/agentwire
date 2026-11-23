@@ -1,0 +1,37 @@
+{
+  "title": "AgentWire (swarmwire): Compact Binary Wire Protocol and Verifiable Policy Runtime for Multi-Agent AI Systems",
+  "description": "AgentWire (published on PyPI as swarmwire) is a compact, cryptographically verifiable binary wire protocol (AW01) and deterministic policy runtime for multi-agent AI systems. Built with a Rust core and PyO3 Python bindings, it provides static-dictionary + varint binary serialization, constant-time HMAC-SHA256 frame authentication with replay protection, two-phase Reserve/Settle budget accounting, a networked length-prefixed TCP RPC transport, drop-in LangGraph and CrewAI adapters, and a 1:1 lossless live SSE trace decompiler dashboard.",
+  "upload_type": "software",
+  "creators": [
+    {
+      "name": "Pandey, Alok",
+      "affiliation": "Independent Researcher"
+    }
+  ],
+  "keywords": [
+    "multi-agent AI systems",
+    "binary RPC wire protocol",
+    "deterministic policy engine",
+    "HMAC-SHA256",
+    "Rust",
+    "PyO3",
+    "LangGraph",
+    "CrewAI",
+    "observability",
+    "software engineering"
+  ],
+  "license": "MIT",
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/alok-108/agentwire",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    },
+    {
+      "identifier": "https://pypi.org/project/swarmwire/",
+      "relation": "isIdenticalTo",
+      "scheme": "url"
+    }
+  ],
+  "access_right": "open"
+}
