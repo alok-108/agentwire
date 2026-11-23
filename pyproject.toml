@@ -3,14 +3,25 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "agentwire"
+name = "agentwire-rpc"
 version = "0.2.0"
 description = "A compact, cryptographically verifiable binary wire protocol and deterministic policy runtime for multi-agent AI systems."
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.10"
-authors = [{ name = "AgentWire Contributors" }]
-keywords = ["ai-agents", "multi-agent", "rpc", "protocol", "langgraph", "crewai", "rust"]
+requires-python = ">=3.10,<3.14"
+authors = [{ name = "Alok Verma", email = "166419621+alok-108@users.noreply.github.com" }]
+keywords = [
+    "ai-agents",
+    "multi-agent",
+    "rpc",
+    "binary-protocol",
+    "langgraph",
+    "crewai",
+    "rust",
+    "pyo3",
+    "policy-engine",
+    "observability",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -21,6 +32,9 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = []
 
@@ -34,13 +48,20 @@ langgraph = ["langgraph>=0.2"]
 crewai = ["crewai>=0.80"]
 
 [project.urls]
+Homepage = "https://github.com/alok-108/agentwire"
 Repository = "https://github.com/alok-108/agentwire"
+Issues = "https://github.com/alok-108/agentwire/issues"
+Changelog = "https://github.com/alok-108/agentwire/releases"
 
 [tool.maturin]
 manifest-path = "crates/agentwire-py/Cargo.toml"
 python-source = "python"
 module-name = "agentwire._agentwire"
 features = ["extension-module"]
+include = [
+    { path = "LICENSE", format = ["sdist", "wheel"] },
+    { path = "README.md", format = ["sdist", "wheel"] },
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
