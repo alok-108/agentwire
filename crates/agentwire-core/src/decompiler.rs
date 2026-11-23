@@ -97,7 +97,9 @@ pub fn decompile_frame(frame: &WireFrame) -> TraceSummary {
     let b = &frame.body;
     let budget_usd = (h.budget.max_micro_usd as f64) / 1_000_000.0;
     let guard_verified = (h.flags & FrameFlags::GUARD_VERIFIED) != 0;
-    let authenticated = (h.flags & FrameFlags::AUTHENTICATED) != 0;
+    let has_hmac = (h.flags & FrameFlags::AUTHENTICATED) != 0;
+    let has_ed25519 = (h.flags & FrameFlags::SIGNED_ED25519) != 0;
+    let authenticated = has_hmac || has_ed25519;
     let mac_verified = h.mac_verified;
     let canonical_ast = decompile_ast(b);
 
@@ -147,9 +149,13 @@ pub fn decompile_frame(frame: &WireFrame) -> TraceSummary {
         budget_usd
     );
 
-    let auth_label = if mac_verified {
+    let auth_label = if mac_verified && has_ed25519 {
+        "ED25519_VERIFIED"
+    } else if mac_verified {
         "HMAC_VERIFIED"
-    } else if authenticated {
+    } else if has_ed25519 {
+        "ED25519_UNVERIFIED"
+    } else if has_hmac {
         "HMAC_UNVERIFIED"
     } else {
         "UNSIGNED"

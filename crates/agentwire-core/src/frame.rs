@@ -30,6 +30,7 @@
 
 use std::collections::BTreeMap;
 
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -47,6 +48,12 @@ pub const PROTOCOL_VERSION: u8 = 1;
 
 /// Length in bytes of an HMAC-SHA256 authentication tag.
 pub const HMAC_TAG_LEN: usize = 32;
+
+/// Length in bytes of an Ed25519 private seed or public key.
+pub const ED25519_KEY_LEN: usize = 32;
+
+/// Length in bytes of an Ed25519 detached signature.
+pub const ED25519_SIG_LEN: usize = 64;
 
 /// Maximum AST nesting depth accepted by the decoder to prevent stack exhaustion attacks.
 const MAX_NESTING_DEPTH: usize = 32;
@@ -211,6 +218,8 @@ impl FrameFlags {
     pub const HAS_REFS: u8 = 0b0001_0000;
     /// Frame carries `nonce`, `timestamp_ms`, and a 32-byte HMAC-SHA256 authentication tag.
     pub const AUTHENTICATED: u8 = 0b0010_0000;
+    /// Frame carries `nonce`, `timestamp_ms`, and a 64-byte per-agent Ed25519 signature.
+    pub const SIGNED_ED25519: u8 = 0b0100_0000;
 }
 
 /// Execution budget cap carried in the frame header.
@@ -343,15 +352,40 @@ pub enum WireError {
     #[error("signing key must be non-empty")]
     InvalidKey,
 
-    #[error("frame is not cryptographically authenticated (FLAG_AUTHENTICATED unset)")]
+    #[error("frame is not cryptographically authenticated (missing HMAC or Ed25519 flag)")]
     UnauthenticatedFrame,
 
-    #[error("HMAC-SHA256 authentication failed (tampered payload or wrong key)")]
+    #[error("cryptographic authentication failed (tampered payload, wrong key, or forged identity)")]
     AuthenticationFailed,
+
+    #[error("unknown signer identity '{0}': no Ed25519 public key registered")]
+    UnknownSigner(String),
+
+    #[error("mutually exclusive auth flags set (both HMAC and Ed25519)")]
+    ConflictingAuthFlags,
+
+    #[error("OS CSPRNG failure while generating Ed25519 keypair")]
+    RngError,
 }
 
-/// Internal encoder returning frame bytes up to the end of the AST body (before MAC & CRC32).
-fn encode_body_prefix(frame: &WireFrame, authenticated: bool) -> Result<Vec<u8>, WireError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthMode {
+    Unsigned,
+    HmacSha256,
+    Ed25519,
+}
+
+/// Generate a fresh 32-byte Ed25519 `(private_key, public_key)` pair using the OS CSPRNG.
+pub fn generate_ed25519_keypair() -> Result<([u8; ED25519_KEY_LEN], [u8; ED25519_KEY_LEN]), WireError> {
+    let mut seed = [0u8; ED25519_KEY_LEN];
+    getrandom::getrandom(&mut seed).map_err(|_| WireError::RngError)?;
+    let signing = SigningKey::from_bytes(&seed);
+    let verifying = signing.verifying_key();
+    Ok((signing.to_bytes(), verifying.to_bytes()))
+}
+
+/// Internal encoder returning frame bytes up to the end of the AST body (before MAC/sig & CRC32).
+fn encode_body_prefix(frame: &WireFrame, auth_mode: AuthMode) -> Result<Vec<u8>, WireError> {
     let mut buf = Vec::with_capacity(160);
 
     // Synchronize dynamic header flags.
@@ -366,10 +400,11 @@ fn encode_body_prefix(frame: &WireFrame, authenticated: bool) -> Result<Vec<u8>,
     } else {
         flags &= !FrameFlags::HAS_REFS;
     }
-    if authenticated {
-        flags |= FrameFlags::AUTHENTICATED;
-    } else {
-        flags &= !FrameFlags::AUTHENTICATED;
+    flags &= !(FrameFlags::AUTHENTICATED | FrameFlags::SIGNED_ED25519);
+    match auth_mode {
+        AuthMode::Unsigned => {}
+        AuthMode::HmacSha256 => flags |= FrameFlags::AUTHENTICATED,
+        AuthMode::Ed25519 => flags |= FrameFlags::SIGNED_ED25519,
     }
 
     // 1. Fixed prefix: Magic + Version + Flags
@@ -383,7 +418,7 @@ fn encode_body_prefix(frame: &WireFrame, authenticated: bool) -> Result<Vec<u8>,
     write_varuint(&mut buf, frame.header.hop_depth as u64);
 
     // 2b. Authentication replay/freshness metadata
-    if authenticated {
+    if auth_mode != AuthMode::Unsigned {
         write_varuint(&mut buf, frame.header.nonce);
         write_varuint(&mut buf, frame.header.timestamp_ms);
     }
@@ -422,7 +457,7 @@ fn encode_body_prefix(frame: &WireFrame, authenticated: bool) -> Result<Vec<u8>,
 
 /// Encode an unsigned [`WireFrame`] into its compact binary representation with a trailing CRC32 checksum.
 pub fn encode_frame(frame: &WireFrame) -> Result<Vec<u8>, WireError> {
-    let mut buf = encode_body_prefix(frame, false)?;
+    let mut buf = encode_body_prefix(frame, AuthMode::Unsigned)?;
     let crc = crc32fast::hash(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
     Ok(buf)
@@ -430,13 +465,11 @@ pub fn encode_frame(frame: &WireFrame) -> Result<Vec<u8>, WireError> {
 
 /// Encode and cryptographically sign a [`WireFrame`] using HMAC-SHA256 over the full canonical
 /// wire frame (magic, version, flags, trace/span/hop, nonce, timestamp, endpoints, budget, and AST).
-///
-/// The resulting wire layout appends the 32-byte HMAC-SHA256 tag followed by the 4-byte CRC32.
 pub fn sign_frame(frame: &WireFrame, key: &[u8]) -> Result<Vec<u8>, WireError> {
     if key.is_empty() {
         return Err(WireError::InvalidKey);
     }
-    let mut buf = encode_body_prefix(frame, true)?;
+    let mut buf = encode_body_prefix(frame, AuthMode::HmacSha256)?;
     let mut mac = HmacSha256::new_from_slice(key).map_err(|_| WireError::InvalidKey)?;
     mac.update(&buf);
     let tag = mac.finalize().into_bytes();
@@ -447,18 +480,41 @@ pub fn sign_frame(frame: &WireFrame, key: &[u8]) -> Result<Vec<u8>, WireError> {
     Ok(buf)
 }
 
-/// Internal decoder supporting optional mandatory HMAC-SHA256 verification.
-fn decode_frame_internal(bytes: &[u8], verify_key: Option<&[u8]>) -> Result<WireFrame, WireError> {
-    // Minimum frame: 4 magic + 1 version + 1 flags + 4 crc32 = 10 bytes.
+/// Encode and asymmetrically sign a [`WireFrame`] using the sender's 32-byte Ed25519 private key.
+///
+/// Unlike shared-secret HMAC, each agent holds its own Ed25519 private key while receivers hold
+/// only public keys (`source_agent -> [u8; 32]`), preventing any compromised peer from
+/// impersonating another agent's `source_agent` identity.
+pub fn sign_frame_ed25519(frame: &WireFrame, private_key: &[u8]) -> Result<Vec<u8>, WireError> {
+    let key_bytes: [u8; ED25519_KEY_LEN] = private_key
+        .try_into()
+        .map_err(|_| WireError::InvalidKey)?;
+    let signing_key = SigningKey::from_bytes(&key_bytes);
+
+    let mut buf = encode_body_prefix(frame, AuthMode::Ed25519)?;
+    let sig = signing_key.sign(&buf);
+    buf.extend_from_slice(&sig.to_bytes());
+
+    let crc = crc32fast::hash(&buf);
+    buf.extend_from_slice(&crc.to_le_bytes());
+    Ok(buf)
+}
+
+enum VerifyMode<'a> {
+    None,
+    Hmac(&'a [u8]),
+    Ed25519(&'a BTreeMap<String, [u8; ED25519_KEY_LEN]>),
+}
+
+/// Internal decoder supporting optional mandatory HMAC-SHA256 or per-agent Ed25519 verification.
+fn decode_frame_internal(bytes: &[u8], verify_mode: VerifyMode<'_>) -> Result<WireFrame, WireError> {
     if bytes.len() < 10 {
         return Err(WireError::UnexpectedEof);
     }
-
     if bytes[0..4] != MAGIC_BYTES {
         return Err(WireError::InvalidMagic);
     }
 
-    // Verify trailing CRC32 before inspecting payload.
     let crc_start = bytes.len() - 4;
     let expected_crc = u32::from_le_bytes([
         bytes[crc_start],
@@ -480,32 +536,52 @@ fn decode_frame_internal(bytes: &[u8], verify_key: Option<&[u8]>) -> Result<Wire
     }
 
     let flags = bytes[5];
-    let is_authenticated = (flags & FrameFlags::AUTHENTICATED) != 0;
+    let has_hmac = (flags & FrameFlags::AUTHENTICATED) != 0;
+    let has_ed25519 = (flags & FrameFlags::SIGNED_ED25519) != 0;
+    if has_hmac && has_ed25519 {
+        return Err(WireError::ConflictingAuthFlags);
+    }
 
-    let (body_end, mac_verified) = if is_authenticated {
+    let has_auth_fields = has_hmac || has_ed25519;
+
+    let (body_end, mut mac_verified, ed25519_sig_slice) = if has_hmac {
         if crc_start < 6 + HMAC_TAG_LEN {
             return Err(WireError::UnexpectedEof);
         }
         let mac_start = crc_start - HMAC_TAG_LEN;
         let tag_slice = &bytes[mac_start..crc_start];
-        if let Some(key) = verify_key {
-            if key.is_empty() {
-                return Err(WireError::InvalidKey);
+        match verify_mode {
+            VerifyMode::Hmac(key) => {
+                if key.is_empty() {
+                    return Err(WireError::InvalidKey);
+                }
+                let mut mac = HmacSha256::new_from_slice(key).map_err(|_| WireError::InvalidKey)?;
+                mac.update(&bytes[..mac_start]);
+                mac.verify_slice(tag_slice)
+                    .map_err(|_| WireError::AuthenticationFailed)?;
+                (mac_start, true, None)
             }
-            let mut mac = HmacSha256::new_from_slice(key).map_err(|_| WireError::InvalidKey)?;
-            mac.update(&bytes[..mac_start]);
-            mac.verify_slice(tag_slice)
-                .map_err(|_| WireError::AuthenticationFailed)?;
-            (mac_start, true)
-        } else {
-            // Decoded without verifying MAC (e.g. read-only observability inspection).
-            (mac_start, false)
+            VerifyMode::Ed25519(_) => return Err(WireError::UnauthenticatedFrame),
+            VerifyMode::None => (mac_start, false, None),
+        }
+    } else if has_ed25519 {
+        if crc_start < 6 + ED25519_SIG_LEN {
+            return Err(WireError::UnexpectedEof);
+        }
+        let sig_start = crc_start - ED25519_SIG_LEN;
+        let sig_slice = &bytes[sig_start..crc_start];
+        match verify_mode {
+            VerifyMode::Hmac(_) => return Err(WireError::UnauthenticatedFrame),
+            VerifyMode::Ed25519(_) => (sig_start, false, Some((sig_start, sig_slice))),
+            VerifyMode::None => (sig_start, false, None),
         }
     } else {
-        if verify_key.is_some() {
-            return Err(WireError::UnauthenticatedFrame);
+        match verify_mode {
+            VerifyMode::None => (crc_start, false, None),
+            VerifyMode::Hmac(_) | VerifyMode::Ed25519(_) => {
+                return Err(WireError::UnauthenticatedFrame)
+            }
         }
-        (crc_start, false)
     };
 
     let use_dict = (flags & FrameFlags::DICT_COMPRESSED) != 0;
@@ -515,7 +591,7 @@ fn decode_frame_internal(bytes: &[u8], verify_key: Option<&[u8]>) -> Result<Wire
     let span_id = u32::try_from(cursor.read_varuint()?).map_err(|_| WireError::InvalidVarint)?;
     let hop_depth = u16::try_from(cursor.read_varuint()?).map_err(|_| WireError::InvalidVarint)?;
 
-    let (nonce, timestamp_ms) = if is_authenticated {
+    let (nonce, timestamp_ms) = if has_auth_fields {
         (cursor.read_varuint()?, cursor.read_varuint()?)
     } else {
         (0, 0)
@@ -523,6 +599,25 @@ fn decode_frame_internal(bytes: &[u8], verify_key: Option<&[u8]>) -> Result<Wire
 
     let source_agent = cursor.read_compact_str(use_dict)?;
     let target_agent = cursor.read_compact_str(use_dict)?;
+
+    // Verify per-agent Ed25519 signature bound strictly to `source_agent`'s registered public key!
+    if let (VerifyMode::Ed25519(registry), Some((sig_start, sig_slice))) =
+        (verify_mode, ed25519_sig_slice)
+    {
+        let pub_bytes = registry
+            .get(&source_agent)
+            .ok_or_else(|| WireError::UnknownSigner(source_agent.clone()))?;
+        let verifying_key =
+            VerifyingKey::from_bytes(pub_bytes).map_err(|_| WireError::InvalidKey)?;
+        let sig_arr: [u8; ED25519_SIG_LEN] = sig_slice
+            .try_into()
+            .map_err(|_| WireError::AuthenticationFailed)?;
+        let sig = Signature::from_bytes(&sig_arr);
+        verifying_key
+            .verify(&bytes[..sig_start], &sig)
+            .map_err(|_| WireError::AuthenticationFailed)?;
+        mac_verified = true;
+    }
 
     let budget = if (flags & FrameFlags::HAS_BUDGET) != 0 {
         let max_tokens =
@@ -596,20 +691,25 @@ fn decode_frame_internal(bytes: &[u8], verify_key: Option<&[u8]>) -> Result<Wire
     })
 }
 
-/// Decode and CRC32-check a binary AgentWire frame without verifying HMAC.
+/// Decode and CRC32-check a binary AgentWire frame without verifying cryptographic MAC/signature.
 ///
-/// Always returns `header.mac_verified == false`. For untrusted or networked inputs, use
-/// [`verify_and_decode_frame`] with a shared secret key.
+/// Always returns `header.mac_verified == false`.
 pub fn decode_frame(bytes: &[u8]) -> Result<WireFrame, WireError> {
-    decode_frame_internal(bytes, None)
+    decode_frame_internal(bytes, VerifyMode::None)
 }
 
 /// Cryptographically verify the HMAC-SHA256 tag (constant-time) and decode a signed AgentWire frame.
-///
-/// Returns `Ok(WireFrame)` with `header.mac_verified == true` on success, or
-/// `Err(WireError::AuthenticationFailed)` / `Err(WireError::UnauthenticatedFrame)` on failure.
 pub fn verify_and_decode_frame(bytes: &[u8], key: &[u8]) -> Result<WireFrame, WireError> {
-    decode_frame_internal(bytes, Some(key))
+    decode_frame_internal(bytes, VerifyMode::Hmac(key))
+}
+
+/// Cryptographically verify an Ed25519 signature against the sender's registered public key
+/// (`pubkeys[frame.header.source_agent]`) and decode the frame (`header.mac_verified == true`).
+pub fn verify_and_decode_ed25519(
+    bytes: &[u8],
+    pubkeys: &BTreeMap<String, [u8; ED25519_KEY_LEN]>,
+) -> Result<WireFrame, WireError> {
+    decode_frame_internal(bytes, VerifyMode::Ed25519(pubkeys))
 }
 
 #[inline]
@@ -944,6 +1044,49 @@ mod tests {
         assert_eq!(
             verify_and_decode_frame(&forged, key).unwrap_err(),
             WireError::AuthenticationFailed
+        );
+    }
+
+    #[test]
+    fn ed25519_per_agent_identity_blocks_impersonation() {
+        let (planner_priv, planner_pub) = generate_ed25519_keypair().unwrap();
+        let (researcher_priv, researcher_pub) = generate_ed25519_keypair().unwrap();
+
+        let mut pubkeys = BTreeMap::new();
+        pubkeys.insert("planner".to_string(), planner_pub);
+        pubkeys.insert("researcher".to_string(), researcher_pub);
+
+        let mut header = FrameHeader::new("planner", "coder", 77, 1);
+        header.nonce = 44001;
+        header.timestamp_ms = 1_763_900_000_000;
+        let body = AstNode::new(AgentAction::Delegate, "repo:core", "apply_patch");
+        let frame = WireFrame::new(header, body);
+
+        // Legitimate planner signature verifies cleanly
+        let signed_by_planner = sign_frame_ed25519(&frame, &planner_priv).unwrap();
+        let verified = verify_and_decode_ed25519(&signed_by_planner, &pubkeys).unwrap();
+        assert!(verified.header.mac_verified);
+        assert_eq!(verified.header.source_agent, "planner");
+
+        // Compromised researcher tries to impersonate `planner` using researcher's own private key -> REJECTED!
+        let impersonation = sign_frame_ed25519(&frame, &researcher_priv).unwrap();
+        assert_eq!(
+            verify_and_decode_ed25519(&impersonation, &pubkeys).unwrap_err(),
+            WireError::AuthenticationFailed
+        );
+
+        // Unregistered agent rejected with UnknownSigner
+        let mut unknown_hdr = FrameHeader::new("rogue_agent", "coder", 77, 2);
+        unknown_hdr.nonce = 44002;
+        unknown_hdr.timestamp_ms = 1_763_900_000_000;
+        let unknown_frame = sign_frame_ed25519(
+            &WireFrame::new(unknown_hdr, AstNode::new(AgentAction::Query, "docs:a", "search")),
+            &researcher_priv,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_and_decode_ed25519(&unknown_frame, &pubkeys).unwrap_err(),
+            WireError::UnknownSigner("rogue_agent".to_string())
         );
     }
 

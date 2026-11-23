@@ -7,10 +7,12 @@ use std::sync::Mutex;
 
 use agentwire_core::{
     decompile_ast, decompile_frame as core_decompile_frame, decode_frame as core_decode_frame,
-    encode_frame as core_encode_frame, sign_frame as core_sign_frame,
+    encode_frame as core_encode_frame, generate_ed25519_keypair as core_generate_ed25519_keypair,
+    sign_frame as core_sign_frame, sign_frame_ed25519 as core_sign_frame_ed25519,
+    verify_and_decode_ed25519 as core_verify_and_decode_ed25519,
     verify_and_decode_frame as core_verify_and_decode_frame, AgentAction, AstNode, AstValue,
-    BudgetCap, FrameFlags, FrameHeader, WireFrame, HMAC_TAG_LEN, MAGIC_BYTES, PROTOCOL_VERSION,
-    STATIC_DICT,
+    BudgetCap, FrameFlags, FrameHeader, WireFrame, ED25519_KEY_LEN, ED25519_SIG_LEN, HMAC_TAG_LEN,
+    MAGIC_BYTES, PROTOCOL_VERSION, STATIC_DICT,
 };
 use agentwire_validator::{PolicyEngine as CorePolicyEngine, ValidationResult};
 use pyo3::exceptions::PyValueError;
@@ -122,7 +124,11 @@ fn frame_to_py_dict<'py>(py: Python<'py>, frame: &WireFrame) -> PyResult<Bound<'
     )?;
     header.set_item(
         "authenticated",
-        (frame.header.flags & FrameFlags::AUTHENTICATED) != 0,
+        (frame.header.flags & (FrameFlags::AUTHENTICATED | FrameFlags::SIGNED_ED25519)) != 0,
+    )?;
+    header.set_item(
+        "signed_ed25519",
+        (frame.header.flags & FrameFlags::SIGNED_ED25519) != 0,
     )?;
     header.set_item("mac_verified", frame.header.mac_verified)?;
 
@@ -348,21 +354,138 @@ fn verify_frame<'py>(
     frame_to_py_dict(py, &frame)
 }
 
-/// Stateless single-frame policy validation (with optional HMAC verification & timestamp skew check).
+fn py_dict_to_pubkeys(
+    public_keys: &Bound<'_, PyDict>,
+) -> PyResult<BTreeMap<String, [u8; ED25519_KEY_LEN]>> {
+    let mut map = BTreeMap::new();
+    for (k, v) in public_keys.iter() {
+        let agent: String = k.extract()?;
+        let raw: Vec<u8> = v.extract()?;
+        let arr: [u8; ED25519_KEY_LEN] = raw.try_into().map_err(|_| {
+            PyValueError::new_err(format!(
+                "Ed25519 public key for '{}' must be exactly {} bytes",
+                agent, ED25519_KEY_LEN
+            ))
+        })?;
+        map.insert(agent, arr);
+    }
+    Ok(map)
+}
+
+fn decode_with_optional_auth(
+    raw_bytes: &[u8],
+    signing_key: Option<&[u8]>,
+    public_keys: Option<&Bound<'_, PyDict>>,
+) -> PyResult<WireFrame> {
+    if let Some(pk_dict) = public_keys {
+        let registry = py_dict_to_pubkeys(pk_dict)?;
+        return core_verify_and_decode_ed25519(raw_bytes, &registry)
+            .map_err(|e| PyValueError::new_err(e.to_string()));
+    }
+    if let Some(key) = signing_key {
+        return core_verify_and_decode_frame(raw_bytes, key)
+            .map_err(|e| PyValueError::new_err(e.to_string()));
+    }
+    core_decode_frame(raw_bytes).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// Generate a fresh 32-byte Ed25519 `(private_key, public_key)` pair using the OS CSPRNG.
 #[pyfunction]
-#[pyo3(signature = (raw_bytes, policy_json=None, signing_key=None, now_ms=None))]
+fn generate_ed25519_keypair<'py>(
+    py: Python<'py>,
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let (priv_k, pub_k) =
+        core_generate_ed25519_keypair().map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((PyBytes::new(py, &priv_k), PyBytes::new(py, &pub_k)))
+}
+
+/// Encode and asymmetrically sign an AgentWire AST frame using the sender's 32-byte Ed25519 private key.
+#[pyfunction]
+#[pyo3(signature = (
+    source_agent,
+    target_agent,
+    action,
+    target,
+    intent,
+    private_key,
+    nonce,
+    timestamp_ms,
+    payload=None,
+    refs=None,
+    trace_id=1,
+    span_id=1,
+    hop_depth=0,
+    max_tokens=2048,
+    max_micro_usd=50_000,
+    guard_verified=false
+))]
+#[allow(clippy::too_many_arguments)]
+fn sign_ast_ed25519<'py>(
+    py: Python<'py>,
+    source_agent: &str,
+    target_agent: &str,
+    action: &str,
+    target: &str,
+    intent: &str,
+    private_key: &[u8],
+    nonce: u64,
+    timestamp_ms: u64,
+    payload: Option<&Bound<'py, PyDict>>,
+    refs: Option<Vec<String>>,
+    trace_id: u64,
+    span_id: u32,
+    hop_depth: u16,
+    max_tokens: u32,
+    max_micro_usd: u64,
+    guard_verified: bool,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let frame = build_frame(
+        source_agent,
+        target_agent,
+        action,
+        target,
+        intent,
+        payload,
+        refs,
+        trace_id,
+        span_id,
+        hop_depth,
+        max_tokens,
+        max_micro_usd,
+        guard_verified,
+        nonce,
+        timestamp_ms,
+    )?;
+    let encoded = core_sign_frame_ed25519(&frame, private_key)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(PyBytes::new(py, &encoded))
+}
+
+/// Cryptographically verify an Ed25519-signed frame strictly against `public_keys[source_agent]`.
+#[pyfunction]
+fn verify_frame_ed25519<'py>(
+    py: Python<'py>,
+    raw_bytes: &[u8],
+    public_keys: &Bound<'py, PyDict>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let registry = py_dict_to_pubkeys(public_keys)?;
+    let frame = core_verify_and_decode_ed25519(raw_bytes, &registry)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    frame_to_py_dict(py, &frame)
+}
+
+/// Stateless single-frame policy validation (with optional HMAC or Ed25519 verification & clock skew check).
+#[pyfunction]
+#[pyo3(signature = (raw_bytes, policy_json=None, signing_key=None, now_ms=None, public_keys=None))]
 fn validate_frame<'py>(
     py: Python<'py>,
     raw_bytes: &[u8],
     policy_json: Option<&str>,
     signing_key: Option<&[u8]>,
     now_ms: Option<u64>,
+    public_keys: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let frame = match signing_key {
-        Some(key) => core_verify_and_decode_frame(raw_bytes, key)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        None => core_decode_frame(raw_bytes).map_err(|e| PyValueError::new_err(e.to_string()))?,
-    };
+    let frame = decode_with_optional_auth(raw_bytes, signing_key, public_keys)?;
 
     let engine = match policy_json {
         Some(json) => CorePolicyEngine::from_json(json)
@@ -376,17 +499,14 @@ fn validate_frame<'py>(
 
 /// Losslessly decompile a binary AgentWire frame into a human-readable trace summary dictionary.
 #[pyfunction]
-#[pyo3(signature = (raw_bytes, signing_key=None))]
+#[pyo3(signature = (raw_bytes, signing_key=None, public_keys=None))]
 fn decompile_frame<'py>(
     py: Python<'py>,
     raw_bytes: &[u8],
     signing_key: Option<&[u8]>,
+    public_keys: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let frame = match signing_key {
-        Some(key) => core_verify_and_decode_frame(raw_bytes, key)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        None => core_decode_frame(raw_bytes).map_err(|e| PyValueError::new_err(e.to_string()))?,
-    };
+    let frame = decode_with_optional_auth(raw_bytes, signing_key, public_keys)?;
     let summary = core_decompile_frame(&frame);
 
     let out = PyDict::new(py);
@@ -439,6 +559,7 @@ fn protocol_info<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
     out.set_item("version", PROTOCOL_VERSION)?;
     out.set_item("static_dict_size", STATIC_DICT.len())?;
     out.set_item("hmac_tag_bytes", HMAC_TAG_LEN)?;
+    out.set_item("ed25519_sig_bytes", ED25519_SIG_LEN)?;
     Ok(out)
 }
 
@@ -497,21 +618,17 @@ impl PyPolicyEngine {
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
-    /// Pure read-only validation of a binary frame (optionally verifying HMAC-SHA256 & clock skew).
-    #[pyo3(signature = (raw_bytes, signing_key=None, now_ms=None))]
+    /// Pure read-only validation of a binary frame (optionally verifying HMAC-SHA256 or Ed25519 & clock skew).
+    #[pyo3(signature = (raw_bytes, signing_key=None, now_ms=None, public_keys=None))]
     fn validate_frame<'py>(
         &self,
         py: Python<'py>,
         raw_bytes: &[u8],
         signing_key: Option<&[u8]>,
         now_ms: Option<u64>,
+        public_keys: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let frame = match signing_key {
-            Some(key) => core_verify_and_decode_frame(raw_bytes, key)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-            None => core_decode_frame(raw_bytes)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        };
+        let frame = decode_with_optional_auth(raw_bytes, signing_key, public_keys)?;
         let guard = self
             .inner
             .lock()
@@ -520,22 +637,18 @@ impl PyPolicyEngine {
         validation_result_to_py(py, &res)
     }
 
-    /// Phase 1 (Reserve): evaluate invariants, verify HMAC if `signing_key` supplied, reserve budget,
+    /// Phase 1 (Reserve): evaluate invariants, verify HMAC or Ed25519 if supplied, reserve budget,
     /// and record replay nonce + hop signature on acceptance.
-    #[pyo3(signature = (raw_bytes, signing_key=None, now_ms=None))]
+    #[pyo3(signature = (raw_bytes, signing_key=None, now_ms=None, public_keys=None))]
     fn evaluate_and_record<'py>(
         &self,
         py: Python<'py>,
         raw_bytes: &[u8],
         signing_key: Option<&[u8]>,
         now_ms: Option<u64>,
+        public_keys: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let frame = match signing_key {
-            Some(key) => core_verify_and_decode_frame(raw_bytes, key)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-            None => core_decode_frame(raw_bytes)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        };
+        let frame = decode_with_optional_auth(raw_bytes, signing_key, public_keys)?;
         let mut guard = self
             .inner
             .lock()
@@ -635,8 +748,11 @@ impl PyPolicyEngine {
 fn _agentwire(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_ast, m)?)?;
     m.add_function(wrap_pyfunction!(sign_ast, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_ed25519_keypair, m)?)?;
+    m.add_function(wrap_pyfunction!(sign_ast_ed25519, m)?)?;
     m.add_function(wrap_pyfunction!(decode_frame, m)?)?;
     m.add_function(wrap_pyfunction!(verify_frame, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_frame_ed25519, m)?)?;
     m.add_function(wrap_pyfunction!(validate_frame, m)?)?;
     m.add_function(wrap_pyfunction!(decompile_frame, m)?)?;
     m.add_function(wrap_pyfunction!(decompile_ast_dict, m)?)?;

@@ -1,4 +1,4 @@
-# AgentWire (`AW01` v0.3.1)
+# AgentWire (`AW01` v0.4.0)
 
 [![Rust 2021](https://img.shields.io/badge/Rust-2021-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -52,12 +52,13 @@ Rather than being another multi-agent orchestration framework, **AgentWire** is 
 
 ## Security & Trust Model
 
-AgentWire explicitly separates **transport integrity**, **cryptographic authenticity**, and **authorization**:
+AgentWire explicitly separates **transport confidentiality**, **per-agent asymmetric identity**, **replay/idempotency persistence**, and **authorization** (see full threat boundaries in [SECURITY.md](SECURITY.md)):
 
-1. **CRC32 vs. HMAC-SHA256:** CRC32 detects accidental transport corruption only. For untrusted or cross-process links, `sign_ast` / `verify_frame` authenticate the full canonical wire header, nonce, timestamp, and AST body using constant-time **HMAC-SHA256** (`32-byte` tag).
-2. **Zero-Trust Receiver Validation:** The header `GUARD_VERIFIED` flag is advisory metadata only. `PolicyEngine` intentionally ignores it, and `AgentWireRpcServer` always independently verifies HMAC-SHA256 and re-evaluates policy on every inbound packet. `FrameHeader::mac_verified` is never serialized on the wire—it is only set to `true` by Rust `verify_and_decode_frame`.
-3. **Replay & Freshness Protection:** Authenticated frames carry a `nonce` and `timestamp_ms`. `PolicyEngine` tracks seen `(source_agent, nonce)` pairs (`REPLAY_DETECTED`) and rejects frames outside `max_clock_skew_ms` (`EXPIRED_TIMESTAMP`).
-4. **Two-Phase Budget Accounting (`Reserve → Settle / Release`):** Accepting a frame creates an active budget reservation (`reserved_tokens`, `reserved_micro_usd`). Once downstream execution completes, `settle_usage(trace_id, span_id, actual_tokens, actual_micro_usd)` records actual spend and releases unused budget back to the session pool. On error or timeout, `release_reservation` refunds 100%.
+1. **TLS / mTLS Transport Confidentiality:** Pass a standard `ssl.SSLContext` to `AgentWireRpcServer` and `AgentWireRpcClient` to encrypt binary `AW01` frames over TLS 1.2/1.3 (HMAC/Ed25519 authenticate; TLS encrypts).
+2. **Per-Agent Asymmetric Ed25519 Identity:** Each agent holds its own Ed25519 private key (`generate_ed25519_keypair` / `sign_ast_ed25519`) while receivers verify strictly against `public_keys[source_agent]` (`verify_frame_ed25519`). Compromising one agent cannot impersonate any other role. Shared-secret HMAC-SHA256 remains available for symmetric setups.
+3. **Zero-Trust Receiver Validation:** The header `GUARD_VERIFIED` flag is advisory metadata only. `PolicyEngine` intentionally ignores it, and `FrameHeader::mac_verified` is never serialized on the wire.
+4. **Cross-Restart & Multi-Instance Replay + Idempotent Retries:** Plug in `SqliteStateStore(db_path)` (SQLite WAL mode, or implement `StateStore` for Redis/Postgres) to block replayed nonces across restarts and across multiple server instances, and to deduplicate retried `MUTATE`/`DELEGATE` requests via `idempotency_key` so client timeouts never cause duplicate execution.
+5. **Two-Phase Budget Accounting + Independent Usage Metering:** `AgentWireRpcServer` reserves declared budgets on acceptance, independently meters actual inbound AST + outbound payload tokens via `IndependentTokenMeter` (or a custom LLM-gateway `UsageMeter`), settles `max(measured, handler_reported)` via `settle_usage`, and refunds 100% via `release_reservation` on error.
 
 ---
 
@@ -256,7 +257,7 @@ If you use **AgentWire** (`swarmwire`) in academic work, benchmarks, or producti
   author  = {Pandey, Alok},
   title   = {{AgentWire (swarmwire): Compact Binary Wire Protocol and Verifiable Policy Runtime for Multi-Agent AI Systems}},
   year    = {2026},
-  version = {0.3.0},
+  version = {0.4.0},
   doi     = {10.5281/zenodo.24476457},
   url     = {https://github.com/alok-108/agentwire}
 }

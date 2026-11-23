@@ -48,7 +48,7 @@ jobs:
             MATURIN=.venv/bin/maturin
             PYTEST=.venv/bin/pytest
           fi
-          uv pip install --python "$PY" maturin pytest tiktoken
+          uv pip install --python "$PY" maturin pytest tiktoken langgraph
           "$MATURIN" develop --release
           "$PYTEST"
           "$PY" benchmarks/token_latency_bench.py --iterations 100

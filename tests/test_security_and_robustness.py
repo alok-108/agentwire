@@ -74,7 +74,7 @@ def test_hmac_authentication_rejects_tampering_wrong_key_and_unsigned() -> None:
     assert unverified["header"]["mac_verified"] is False
 
     # Wrong key fails constant-time HMAC check
-    with pytest.raises(ValueError, match="HMAC-SHA256 authentication failed"):
+    with pytest.raises(ValueError, match="authentication failed"):
         verify_frame(signed, WRONG_KEY)
 
     # Attacker modifies payload byte AND recomputes CRC32 -> still rejected by HMAC!
@@ -82,7 +82,7 @@ def test_hmac_authentication_rejects_tampering_wrong_key_and_unsigned() -> None:
     tampered[12] ^= 0x55
     crc = zlib.crc32(bytes(tampered[:-4])) & 0xFFFFFFFF
     tampered[-4:] = crc.to_bytes(4, "little")
-    with pytest.raises(ValueError, match="HMAC-SHA256 authentication failed"):
+    with pytest.raises(ValueError, match="authentication failed"):
         verify_frame(bytes(tampered), KEY)
 
     # Strict policy rejects unsigned frames
