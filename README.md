@@ -3,8 +3,9 @@
 [![Rust 2021](https://img.shields.io/badge/Rust-2021-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PyPI](https://img.shields.io/pypi/v/swarmwire?color=3776AB&logo=pypi&logoColor=white)](https://pypi.org/project/swarmwire/)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24476457.svg)](https://doi.org/10.5281/zenodo.24476457)
 [![AgentWire CI](https://github.com/alok-108/agentwire/actions/workflows/ci.yml/badge.svg)](https://github.com/alok-108/agentwire/actions/workflows/ci.yml)
-[![Release v0.2.0](https://img.shields.io/github/v/release/alok-108/agentwire?color=06b6d4)](https://github.com/alok-108/agentwire/releases)
+[![Release](https://img.shields.io/github/v/release/alok-108/agentwire?color=06b6d4)](https://github.com/alok-108/agentwire/releases)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 > **A compact, cryptographically verifiable binary wire protocol and deterministic policy runtime for multi-agent AI systems.**
@@ -248,7 +249,7 @@ cd dashboard && npm install && npm run dev
 
 Created and maintained by **Alok Pandey** ([@alok-108](https://github.com/alok-108)).
 
-If you use **AgentWire** (`swarmwire`) in academic work, benchmarks, or production systems, you can cite it via GitHub's **"Cite this repository"** button ([CITATION.cff](CITATION.cff)) or the BibTeX entry below:
+If you use **AgentWire** (`swarmwire`) in academic work, benchmarks, or production systems, you can cite it via GitHub's **"Cite this repository"** button ([CITATION.cff](CITATION.cff)), Zenodo (**Concept DOI:** [`10.5281/zenodo.24476457`](https://doi.org/10.5281/zenodo.24476457) | **`v0.3.0` Version DOI:** [`10.5281/zenodo.24476458`](https://doi.org/10.5281/zenodo.24476458)), or the BibTeX entry below:
 
 ```bibtex
 @software{pandey2026agentwire,
@@ -256,6 +257,7 @@ If you use **AgentWire** (`swarmwire`) in academic work, benchmarks, or producti
   title   = {{AgentWire (swarmwire): Compact Binary Wire Protocol and Verifiable Policy Runtime for Multi-Agent AI Systems}},
   year    = {2026},
   version = {0.3.0},
+  doi     = {10.5281/zenodo.24476457},
   url     = {https://github.com/alok-108/agentwire}
 }
 ```
