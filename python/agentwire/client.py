@@ -1,11 +1,15 @@
-"""High-level Python SDK client (`WireClient`) and token/byte savings telemetry."""
+"""High-level Python SDK client (`WireClient`), HMAC signing, two-phase budget settlement,
+and token/byte savings telemetry.
+"""
 
 from __future__ import annotations
 
 import json
 import math
+import secrets
+import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from agentwire._agentwire import (
@@ -13,6 +17,8 @@ from agentwire._agentwire import (
     decompile_frame,
     decode_frame,
     encode_ast,
+    sign_ast,
+    verify_frame,
 )
 from agentwire.telemetry.stream import TelemetryStream, TraceEvent, now_ms
 
@@ -51,7 +57,6 @@ class TokenEstimator:
             return 0
         if self._encoding is not None:
             return len(self._encoding.encode(text))
-        # Deterministic approximation calibrated for English + JSON (~3.6 chars/token)
         return max(1, math.ceil(len(text) / 3.6))
 
     def count_json(self, obj: Any) -> int:
@@ -129,9 +134,6 @@ def _synthesize_verbose_baseline(
     max_tokens: int,
     max_micro_usd: int,
 ) -> dict[str, Any]:
-    """Build the realistic equivalent verbose JSON/natural-language handoff payload that
-    multi-agent frameworks (LangGraph/CrewAI/AutoGen) typically serialize between agents.
-    """
     return {
         "protocol": "json-agent-message-v1",
         "metadata": {
@@ -176,8 +178,9 @@ def _synthesize_verbose_baseline(
 
 
 class WireClient:
-    """High-level AgentWire client combining the Rust binary codec, deterministic
-    policy guard-gate, lossless decompiler, and telemetry stream.
+    """Thread-safe high-level AgentWire client combining Rust binary codec, optional
+    HMAC-SHA256 frame authentication, deterministic policy guard-gate with two-phase
+    budget settlement, lossless decompiler, and telemetry stream.
     """
 
     def __init__(
@@ -187,19 +190,46 @@ class WireClient:
         enable_safety_gate: bool = True,
         raise_on_reject: bool = True,
         token_estimator: TokenEstimator | None = None,
+        signing_key: bytes | None = None,
     ) -> None:
-        self.policy = policy if policy is not None else PolicyEngine.default_multi_agent()
+        if policy is not None:
+            self.policy = policy
+        elif signing_key is not None:
+            self.policy = PolicyEngine.strict_authenticated()
+        else:
+            self.policy = PolicyEngine.default_multi_agent()
         self.telemetry = telemetry if telemetry is not None else TelemetryStream()
         self.enable_safety_gate = enable_safety_gate
         self.raise_on_reject = raise_on_reject
         self.token_estimator = token_estimator if token_estimator is not None else TokenEstimator()
+        self.signing_key = signing_key
         self.metrics = WireMetrics()
+        self._lock = threading.Lock()
         self._span_counter = 0
         self._trace_counter = 1000
 
     def next_trace_id(self) -> int:
-        self._trace_counter += 1
-        return self._trace_counter
+        with self._lock:
+            self._trace_counter += 1
+            return self._trace_counter
+
+    def settle_usage(
+        self,
+        trace_id: int,
+        span_id: int,
+        actual_tokens: int,
+        actual_micro_usd: int,
+    ) -> dict[str, Any]:
+        """Settle an active reservation with actual downstream token & cost usage."""
+        return self.policy.settle_usage(trace_id, span_id, actual_tokens, actual_micro_usd)
+
+    def release_reservation(self, trace_id: int, span_id: int) -> dict[str, Any]:
+        """Cancel an active reservation and refund 100% of reserved budget back to session pool."""
+        return self.policy.release_reservation(trace_id, span_id)
+
+    def budget_ledger(self) -> dict[str, Any]:
+        """Return current two-phase session budget ledger (settled, reserved, remaining)."""
+        return self.policy.budget_ledger()
 
     def send(
         self,
@@ -218,49 +248,42 @@ class WireClient:
         max_micro_usd: int = 50_000,
         baseline_payload: dict[str, Any] | str | None = None,
     ) -> WireSendResult:
-        """Compile AST -> binary wire frame -> evaluate Rust guard-gate -> decompile & emit trace."""
+        """Compile AST -> (sign) binary frame -> evaluate Rust guard-gate -> decompile & emit trace."""
         payload_dict = payload or {}
         refs_list = refs or []
         effective_trace = trace_id if trace_id is not None else self.next_trace_id()
-        if span_id is None:
-            self._span_counter += 1
-            effective_span = self._span_counter
-        else:
-            effective_span = span_id
+        with self._lock:
+            if span_id is None:
+                self._span_counter += 1
+                effective_span = self._span_counter
+            else:
+                effective_span = span_id
 
-        # 1. Encode binary frame via Rust core
+        ts_ms = now_ms()
+        nonce = (secrets.randbits(63) or 1) if self.signing_key is not None else 0
+
+        # 1. Encode (and sign via HMAC-SHA256 if signing_key configured) via Rust core
         t0 = time.perf_counter_ns()
-        raw_frame = encode_ast(
-            source_agent=source_agent,
-            target_agent=target_agent,
-            action=action,
-            target=target,
-            intent=intent,
-            payload=payload_dict,
-            refs=refs_list,
-            trace_id=effective_trace,
-            span_id=effective_span,
-            hop_depth=hop_depth,
-            max_tokens=max_tokens,
-            max_micro_usd=max_micro_usd,
-            guard_verified=False,
-        )
-        t1 = time.perf_counter_ns()
-        encode_us = (t1 - t0) / 1000.0
-
-        # 2. Deterministic Rust policy guard-gate check (before any wire/LLM transmission!)
-        t2 = time.perf_counter_ns()
-        if self.enable_safety_gate:
-            validation = self.policy.evaluate_and_record(raw_frame)
+        if self.signing_key is not None:
+            raw_frame = sign_ast(
+                source_agent=source_agent,
+                target_agent=target_agent,
+                action=action,
+                target=target,
+                intent=intent,
+                signing_key=self.signing_key,
+                nonce=nonce,
+                timestamp_ms=ts_ms,
+                payload=payload_dict,
+                refs=refs_list,
+                trace_id=effective_trace,
+                span_id=effective_span,
+                hop_depth=hop_depth,
+                max_tokens=max_tokens,
+                max_micro_usd=max_micro_usd,
+                guard_verified=False,
+            )
         else:
-            validation = {"allowed": True, "reason_code": None, "detail": None}
-        t3 = time.perf_counter_ns()
-        validate_us = (t3 - t2) / 1000.0
-
-        allowed = bool(validation["allowed"])
-
-        # Stamp GUARD_VERIFIED flag into the final wire frame when approved
-        if allowed and self.enable_safety_gate:
             raw_frame = encode_ast(
                 source_agent=source_agent,
                 target_agent=target_agent,
@@ -274,16 +297,71 @@ class WireClient:
                 hop_depth=hop_depth,
                 max_tokens=max_tokens,
                 max_micro_usd=max_micro_usd,
-                guard_verified=True,
+                guard_verified=False,
             )
+        t1 = time.perf_counter_ns()
+        encode_us = (t1 - t0) / 1000.0
 
-        # 3. Lossless decompilation for human observability & target agent context
+        # 2. Deterministic Rust policy guard-gate check (reserves budget & records replay nonce)
+        t2 = time.perf_counter_ns()
+        if self.enable_safety_gate:
+            validation = self.policy.evaluate_and_record(
+                raw_frame,
+                signing_key=self.signing_key,
+                now_ms=ts_ms,
+            )
+        else:
+            validation = {"allowed": True, "reason_code": None, "detail": None}
+        t3 = time.perf_counter_ns()
+        validate_us = (t3 - t2) / 1000.0
+
+        allowed = bool(validation["allowed"])
+
+        # Advisory GUARD_VERIFIED flag (receivers always independently verify regardless of flag)
+        if allowed and self.enable_safety_gate:
+            if self.signing_key is not None:
+                raw_frame = sign_ast(
+                    source_agent=source_agent,
+                    target_agent=target_agent,
+                    action=action,
+                    target=target,
+                    intent=intent,
+                    signing_key=self.signing_key,
+                    nonce=nonce,
+                    timestamp_ms=ts_ms,
+                    payload=payload_dict,
+                    refs=refs_list,
+                    trace_id=effective_trace,
+                    span_id=effective_span,
+                    hop_depth=hop_depth,
+                    max_tokens=max_tokens,
+                    max_micro_usd=max_micro_usd,
+                    guard_verified=True,
+                )
+            else:
+                raw_frame = encode_ast(
+                    source_agent=source_agent,
+                    target_agent=target_agent,
+                    action=action,
+                    target=target,
+                    intent=intent,
+                    payload=payload_dict,
+                    refs=refs_list,
+                    trace_id=effective_trace,
+                    span_id=effective_span,
+                    hop_depth=hop_depth,
+                    max_tokens=max_tokens,
+                    max_micro_usd=max_micro_usd,
+                    guard_verified=True,
+                )
+
+        # 3. Lossless decompilation
         t4 = time.perf_counter_ns()
-        summary = decompile_frame(raw_frame)
+        summary = decompile_frame(raw_frame, signing_key=self.signing_key)
         t5 = time.perf_counter_ns()
         decompile_us = (t5 - t4) / 1000.0
 
-        # 4. Compute baseline comparison metrics (verbose JSON vs AgentWire)
+        # 4. Baseline comparison telemetry
         if baseline_payload is None:
             baseline_obj = _synthesize_verbose_baseline(
                 source_agent=source_agent,
@@ -308,11 +386,10 @@ class WireClient:
         baseline_bytes = len(baseline_text.encode("utf-8"))
         wire_bytes = len(raw_frame)
         baseline_tokens = self.token_estimator.count_text(baseline_text)
-        # Compact canonical AST is what gets projected into the receiving LLM's context window
         wire_tokens = self.token_estimator.count_text(summary["canonical_ast"])
 
         event = TraceEvent(
-            timestamp_ms=now_ms(),
+            timestamp_ms=ts_ms,
             trace_id=effective_trace,
             span_id=effective_span,
             hop_depth=hop_depth,
@@ -340,19 +417,19 @@ class WireClient:
             tokenizer=self.token_estimator.backend_label,
         )
 
-        # Update running metrics & stream telemetry
-        self.metrics.frames_sent += 1
-        if allowed:
-            self.metrics.frames_allowed += 1
-        else:
-            self.metrics.frames_rejected += 1
-        self.metrics.baseline_bytes += baseline_bytes
-        self.metrics.wire_bytes += wire_bytes
-        self.metrics.baseline_tokens += baseline_tokens
-        self.metrics.wire_tokens += wire_tokens
-        self.metrics.total_encode_us += encode_us
-        self.metrics.total_validate_us += validate_us
-        self.metrics.total_decompile_us += decompile_us
+        with self._lock:
+            self.metrics.frames_sent += 1
+            if allowed:
+                self.metrics.frames_allowed += 1
+            else:
+                self.metrics.frames_rejected += 1
+            self.metrics.baseline_bytes += baseline_bytes
+            self.metrics.wire_bytes += wire_bytes
+            self.metrics.baseline_tokens += baseline_tokens
+            self.metrics.wire_tokens += wire_tokens
+            self.metrics.total_encode_us += encode_us
+            self.metrics.total_validate_us += validate_us
+            self.metrics.total_decompile_us += decompile_us
 
         self.telemetry.emit(event)
 
@@ -379,16 +456,28 @@ class WireClient:
         raw_bytes: bytes,
         *,
         verify_policy: bool = True,
+        record_in_ledger: bool = False,
     ) -> WireReceiveResult:
-        """Decode an inbound binary AgentWire frame, verify CRC32 + policy, and decompile."""
+        """Independently verify HMAC (when configured), CRC32, and policy on an inbound frame."""
         t0 = time.perf_counter_ns()
-        decoded = decode_frame(raw_bytes)
+        if self.signing_key is not None:
+            decoded = verify_frame(raw_bytes, self.signing_key)
+        else:
+            decoded = decode_frame(raw_bytes)
         t1 = time.perf_counter_ns()
         decode_us = (t1 - t0) / 1000.0
 
         validation: dict[str, Any] | None = None
         if verify_policy and self.enable_safety_gate:
-            validation = self.policy.validate_frame(raw_bytes)
+            ts_now = now_ms()
+            if record_in_ledger:
+                validation = self.policy.evaluate_and_record(
+                    raw_bytes, signing_key=self.signing_key, now_ms=ts_now
+                )
+            else:
+                validation = self.policy.validate_frame(
+                    raw_bytes, signing_key=self.signing_key, now_ms=ts_now
+                )
             if not validation["allowed"] and self.raise_on_reject:
                 raise PolicyViolationError(
                     reason_code=str(validation["reason_code"]),
@@ -397,7 +486,7 @@ class WireClient:
                 )
 
         t2 = time.perf_counter_ns()
-        summary = decompile_frame(raw_bytes)
+        summary = decompile_frame(raw_bytes, signing_key=self.signing_key)
         t3 = time.perf_counter_ns()
         decompile_us = (t3 - t2) / 1000.0
 

@@ -1,4 +1,6 @@
-"""AgentWire — Binary RPC wire protocol and verifiable AST runtime for multi-agent AI systems."""
+"""AgentWire — Compact, cryptographically verifiable binary wire protocol and deterministic
+policy runtime for multi-agent AI systems.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +11,9 @@ from agentwire._agentwire import (
     decode_frame,
     encode_ast,
     protocol_info,
+    sign_ast,
     validate_frame,
+    verify_frame,
 )
 from agentwire.adapters.crewai import CrewAIWire
 from agentwire.adapters.langgraph import LangGraphWire
@@ -22,12 +26,22 @@ from agentwire.client import (
     WireSendResult,
 )
 from agentwire.telemetry.stream import TelemetryStream, TraceEvent
+from agentwire.transport import (
+    AgentWireRpcClient,
+    AgentWireRpcServer,
+    RpcResponse,
+    RpcTransportError,
+)
 
 __all__ = [
+    "AgentWireRpcClient",
+    "AgentWireRpcServer",
     "CrewAIWire",
     "LangGraphWire",
     "PolicyEngine",
     "PolicyViolationError",
+    "RpcResponse",
+    "RpcTransportError",
     "TelemetryStream",
     "TokenEstimator",
     "TraceEvent",
@@ -40,7 +54,9 @@ __all__ = [
     "decode_frame",
     "encode_ast",
     "protocol_info",
+    "sign_ast",
     "validate_frame",
+    "verify_frame",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

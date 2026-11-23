@@ -1,8 +1,4 @@
 //! Lossless 1:1 AST-to-human-readable decompiler & telemetry formatter.
-//!
-//! Every binary AgentWire frame can be deterministically projected back into a concise,
-//! readable natural-language trace **and** a lossless canonical AST representation with
-//! zero semantic drift.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +11,8 @@ pub struct TraceSummary {
     pub trace_id: u64,
     pub span_id: u32,
     pub hop_depth: u16,
+    pub nonce: u64,
+    pub timestamp_ms: u64,
     pub source_agent: String,
     pub target_agent: String,
     pub action: String,
@@ -23,6 +21,8 @@ pub struct TraceSummary {
     pub budget_tokens: u32,
     pub budget_usd: f64,
     pub guard_verified: bool,
+    pub authenticated: bool,
+    pub mac_verified: bool,
     /// Single-line natural-language summary suitable for live UI timelines & logs.
     pub human_readable: String,
     /// Lossless canonical AST string produced by [`decompile_ast`].
@@ -72,7 +72,13 @@ pub fn decompile_ast(node: &AstNode) -> String {
         .collect::<Vec<_>>()
         .join(", ");
 
-    let mut out = format!("{} {}::{}({})", node.action.as_str(), node.target, node.intent, args);
+    let mut out = format!(
+        "{} {}::{}({})",
+        node.action.as_str(),
+        node.target,
+        node.intent,
+        args
+    );
     if !node.refs.is_empty() {
         let refs = node
             .refs
@@ -91,6 +97,8 @@ pub fn decompile_frame(frame: &WireFrame) -> TraceSummary {
     let b = &frame.body;
     let budget_usd = (h.budget.max_micro_usd as f64) / 1_000_000.0;
     let guard_verified = (h.flags & FrameFlags::GUARD_VERIFIED) != 0;
+    let authenticated = (h.flags & FrameFlags::AUTHENTICATED) != 0;
+    let mac_verified = h.mac_verified;
     let canonical_ast = decompile_ast(b);
 
     let verb = match b.action {
@@ -139,13 +147,22 @@ pub fn decompile_frame(frame: &WireFrame) -> TraceSummary {
         budget_usd
     );
 
+    let auth_label = if mac_verified {
+        "HMAC_VERIFIED"
+    } else if authenticated {
+        "HMAC_UNVERIFIED"
+    } else {
+        "UNSIGNED"
+    };
+
     let mut structured_lines = vec![
         format!(
-            "FRAME AW01 v{} | trace={} span={} hop={} | guard={}",
+            "FRAME AW01 v{} | trace={} span={} hop={} | auth={} | guard={}",
             h.version,
             h.trace_id,
             h.span_id,
             h.hop_depth,
+            auth_label,
             if guard_verified { "VERIFIED" } else { "UNVERIFIED" }
         ),
         format!("ROUTE {} -> {}", h.source_agent, h.target_agent),
@@ -156,6 +173,13 @@ pub fn decompile_frame(frame: &WireFrame) -> TraceSummary {
         format!("AST   {}", canonical_ast),
     ];
 
+    if authenticated {
+        structured_lines.push(format!(
+            "AUTH  nonce={} timestamp_ms={}",
+            h.nonce, h.timestamp_ms
+        ));
+    }
+
     if !b.refs.is_empty() {
         structured_lines.push(format!("REFS  {}", b.refs.join(", ")));
     }
@@ -164,6 +188,8 @@ pub fn decompile_frame(frame: &WireFrame) -> TraceSummary {
         trace_id: h.trace_id,
         span_id: h.span_id,
         hop_depth: h.hop_depth,
+        nonce: h.nonce,
+        timestamp_ms: h.timestamp_ms,
         source_agent: h.source_agent.clone(),
         target_agent: h.target_agent.clone(),
         action: b.action.as_str().to_string(),
@@ -172,6 +198,8 @@ pub fn decompile_frame(frame: &WireFrame) -> TraceSummary {
         budget_tokens: h.budget.max_tokens,
         budget_usd,
         guard_verified,
+        authenticated,
+        mac_verified,
         human_readable,
         canonical_ast,
         structured_lines,

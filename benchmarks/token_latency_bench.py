@@ -1,14 +1,16 @@
-"""Reproducible benchmark comparing verbose multi-agent JSON handoffs against AgentWire.
+"""Reproducible, apples-to-apples benchmark for AgentWire (`AW01` v0.2.0).
 
-Simulates a realistic 4-agent engineering pipeline:
-    planner -> researcher -> coder -> reviewer (+ rogue policy-violation check)
-
-Measures:
-  1. Payload wire size (Verbose JSON vs Compact JSON vs AgentWire AW01 binary)
-  2. LLM token usage (tiktoken `cl100k_base` when installed, with explicit label)
-  3. Sub-millisecond Rust codec, guard-gate validation, and decompilation latency (mean & p99)
-  4. Estimated USD savings at scale (100,000 multi-agent hops)
-  5. Deterministic guard-gate blocking of an unauthorized MUTATE from a read-only agent
+Separates three distinct measurements cleanly:
+  A. Wire Serialization Size (Exact Same Semantic AST Struct):
+     Indented JSON vs. Minified JSON vs. RFC 8949 CBOR vs. AgentWire AW01 (Unsigned & HMAC-SHA256)
+  B. LLM Input Context Tokens (`tiktoken:cl100k_base`):
+     Explicitly separates wire compression from LLM context tokens, comparing:
+       1. AgentWire Canonical AST (projected into model context)
+       2. Minimal Compact JSON of the exact same AST (apples-to-apples structural baseline)
+       3. Typical multi-agent framework envelope (system/user wrapper + JSON tool call)
+  C. Rust Core + HMAC-SHA256 + Two-Phase Guard-Gate Latency (`perf_counter_ns`):
+     Encode, HMAC Sign, HMAC Verify + Decode, Policy Reserve + Settle, Decompile, and
+     Pre-Flight Unauthorized/Replay Rejection.
 
 Usage:
     python benchmarks/token_latency_bench.py
@@ -19,7 +21,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 import statistics
+import struct
 import time
 from pathlib import Path
 from typing import Any
@@ -32,7 +36,52 @@ from agentwire import (
     decompile_frame,
     decode_frame,
     encode_ast,
+    sign_ast,
+    verify_frame,
 )
+from agentwire.telemetry.stream import now_ms
+
+
+# ---------------------------------------------------------------------------
+# Minimal, deterministic RFC 8949 CBOR encoder (zero external dependencies)
+# used as an honest binary-serialization baseline on identical AST structs.
+# ---------------------------------------------------------------------------
+def _cbor_head(major: int, n: int) -> bytes:
+    mt = major << 5
+    if n < 24:
+        return bytes([mt | n])
+    if n < 256:
+        return struct.pack("!BB", mt | 24, n)
+    if n < 65536:
+        return struct.pack("!BH", mt | 25, n)
+    if n < 4294967296:
+        return struct.pack("!BI", mt | 26, n)
+    return struct.pack("!BQ", mt | 27, n)
+
+
+def encode_cbor(obj: Any) -> bytes:
+    if obj is None:
+        return b"\xf6"
+    if isinstance(obj, bool):
+        return b"\xf5" if obj else b"\xf4"
+    if isinstance(obj, int):
+        if obj >= 0:
+            return _cbor_head(0, obj)
+        return _cbor_head(1, -1 - obj)
+    if isinstance(obj, float):
+        return b"\xfb" + struct.pack("!d", obj)
+    if isinstance(obj, str):
+        raw = obj.encode("utf-8")
+        return _cbor_head(3, len(raw)) + raw
+    if isinstance(obj, list):
+        return _cbor_head(4, len(obj)) + b"".join(encode_cbor(x) for x in obj)
+    if isinstance(obj, dict):
+        parts = [_cbor_head(5, len(obj))]
+        for k in sorted(obj.keys()):
+            parts.append(encode_cbor(str(k)))
+            parts.append(encode_cbor(obj[k]))
+        return b"".join(parts)
+    raise TypeError(f"unsupported CBOR type: {type(obj)}")
 
 
 def build_workflow_hops(trace_id: int) -> list[dict[str, Any]]:
@@ -55,7 +104,7 @@ def build_workflow_hops(trace_id: int) -> list[dict[str, Any]]:
                 "priority": "high",
                 "strict": True,
             },
-            "verbose_json": {
+            "verbose_envelope": {
                 "protocol": "openai-multi-agent-handoff-v1",
                 "trace_context": {
                     "trace_id": f"trace-{trace_id}",
@@ -121,7 +170,7 @@ def build_workflow_hops(trace_id: int) -> list[dict[str, Any]]:
                 "confidence": 0.97,
                 "delta": "add_currency_minor_units",
             },
-            "verbose_json": {
+            "verbose_envelope": {
                 "protocol": "openai-multi-agent-handoff-v1",
                 "trace_context": {
                     "trace_id": f"trace-{trace_id}",
@@ -181,7 +230,7 @@ def build_workflow_hops(trace_id: int) -> list[dict[str, Any]]:
                 "dry_run": False,
                 "idempotency_key": "patch-418-r1",
             },
-            "verbose_json": {
+            "verbose_envelope": {
                 "protocol": "openai-multi-agent-handoff-v1",
                 "trace_context": {
                     "trace_id": f"trace-{trace_id}",
@@ -241,7 +290,7 @@ def build_workflow_hops(trace_id: int) -> list[dict[str, Any]]:
                 "severity": "low",
                 "comments": 0,
             },
-            "verbose_json": {
+            "verbose_envelope": {
                 "protocol": "openai-multi-agent-handoff-v1",
                 "trace_context": {
                     "trace_id": f"trace-{trace_id}",
@@ -284,6 +333,36 @@ def build_workflow_hops(trace_id: int) -> list[dict[str, Any]]:
     ]
 
 
+def hop_to_equivalent_ast_struct(hop: dict[str, Any], trace_id: int, span_id: int) -> dict[str, Any]:
+    """Exact apples-to-apples semantic struct carrying the exact same fields as an AW01 WireFrame."""
+    return {
+        "v": 1,
+        "trace_id": trace_id,
+        "span_id": span_id,
+        "hop_depth": hop["hop_depth"],
+        "source_agent": hop["source_agent"],
+        "target_agent": hop["target_agent"],
+        "max_tokens": hop["max_tokens"],
+        "max_micro_usd": hop["max_micro_usd"],
+        "action": hop["action"],
+        "target": hop["target"],
+        "intent": hop["intent"],
+        "payload": hop["payload"],
+        "refs": hop["refs"],
+    }
+
+
+def hop_to_minimal_context_json(hop: dict[str, Any]) -> dict[str, Any]:
+    """Minimal JSON representation of the AST body alone (exact same semantic fields as Canonical AST)."""
+    return {
+        "action": hop["action"],
+        "target": hop["target"],
+        "intent": hop["intent"],
+        "payload": hop["payload"],
+        "refs": hop["refs"],
+    }
+
+
 def percentile(values: list[float], p: float) -> float:
     if not values:
         return 0.0
@@ -294,40 +373,65 @@ def percentile(values: list[float], p: float) -> float:
 
 def run_benchmark(iterations: int, export_trace: Path | None) -> dict[str, Any]:
     estimator = TokenEstimator("cl100k_base")
-    policy = PolicyEngine.default_multi_agent()
+    signing_key = b"agentwire-benchmark-hmac-key-32b"
+    policy = PolicyEngine.strict_authenticated()
 
-    verbose_bytes_total = 0
-    compact_json_bytes_total = 0
-    wire_bytes_total = 0
+    # Metric A: Exact same semantic struct wire bytes
+    ast_indented_json_bytes_total = 0
+    ast_compact_json_bytes_total = 0
+    ast_cbor_bytes_total = 0
+    aw_unsigned_bytes_total = 0
+    aw_signed_bytes_total = 0
 
-    verbose_tokens_total = 0
-    wire_ast_tokens_total = 0
+    # Metric B: LLM input context tokens (separated cleanly from wire bytes)
+    verbose_envelope_tokens_total = 0
+    minimal_ast_json_tokens_total = 0
+    canonical_ast_tokens_total = 0
 
+    # Metric C: Latency samples (microseconds)
     encode_us_samples: list[float] = []
-    validate_us_samples: list[float] = []
-    decode_us_samples: list[float] = []
+    sign_us_samples: list[float] = []
+    verify_decode_us_samples: list[float] = []
+    reserve_settle_us_samples: list[float] = []
     decompile_us_samples: list[float] = []
 
     sample_hops = build_workflow_hops(trace_id=1001)
+    ts_base = now_ms()
 
-    # Pre-compute per-hop byte & token sizes once (deterministic across iterations)
-    per_hop_verbose_bytes: list[int] = []
-    per_hop_compact_bytes: list[int] = []
-    per_hop_verbose_tokens: list[int] = []
-    for hop in sample_hops:
-        v_str = json.dumps(hop["verbose_json"], ensure_ascii=False, indent=2)
-        c_str = json.dumps(hop["verbose_json"], ensure_ascii=False, separators=(",", ":"))
-        per_hop_verbose_bytes.append(len(v_str.encode("utf-8")))
-        per_hop_compact_bytes.append(len(c_str.encode("utf-8")))
-        per_hop_verbose_tokens.append(estimator.count_text(v_str))
+    # Pre-compute deterministic baselines for the 4 hops
+    per_hop_baselines: list[dict[str, int]] = []
+    for hop_idx, hop in enumerate(sample_hops):
+        eq_struct = hop_to_equivalent_ast_struct(hop, trace_id=2000, span_id=hop_idx + 1)
+        eq_indented = json.dumps(eq_struct, ensure_ascii=False, indent=2)
+        eq_compact = json.dumps(eq_struct, ensure_ascii=False, separators=(",", ":"))
+        eq_cbor = encode_cbor(eq_struct)
 
-    # Timed benchmark loop over N iterations * 4 hops
+        min_ctx_json = json.dumps(
+            hop_to_minimal_context_json(hop), ensure_ascii=False, separators=(",", ":")
+        )
+        verbose_env = json.dumps(hop["verbose_envelope"], ensure_ascii=False, indent=2)
+
+        per_hop_baselines.append(
+            {
+                "ast_indented_bytes": len(eq_indented.encode("utf-8")),
+                "ast_compact_bytes": len(eq_compact.encode("utf-8")),
+                "ast_cbor_bytes": len(eq_cbor),
+                "verbose_env_tokens": estimator.count_text(verbose_env),
+                "min_ctx_json_tokens": estimator.count_text(min_ctx_json),
+            }
+        )
+
+    nonce_counter = 1
     for i in range(iterations):
         trace_id = 2000 + i
         policy.reset()
         for hop_idx, hop in enumerate(sample_hops):
+            span_id = hop_idx + 1
+            nonce_counter += 1
+
+            # Unsigned encode timing
             t0 = time.perf_counter_ns()
-            raw = encode_ast(
+            raw_unsigned = encode_ast(
                 source_agent=hop["source_agent"],
                 target_agent=hop["target_agent"],
                 action=hop["action"],
@@ -336,53 +440,112 @@ def run_benchmark(iterations: int, export_trace: Path | None) -> dict[str, Any]:
                 payload=hop["payload"],
                 refs=hop["refs"],
                 trace_id=trace_id,
-                span_id=hop_idx + 1,
+                span_id=span_id,
                 hop_depth=hop["hop_depth"],
                 max_tokens=hop["max_tokens"],
                 max_micro_usd=hop["max_micro_usd"],
-                guard_verified=True,
             )
             t1 = time.perf_counter_ns()
-            verdict = policy.evaluate_and_record(raw)
+
+            # HMAC-SHA256 sign timing
+            raw_signed = sign_ast(
+                source_agent=hop["source_agent"],
+                target_agent=hop["target_agent"],
+                action=hop["action"],
+                target=hop["target"],
+                intent=hop["intent"],
+                signing_key=signing_key,
+                nonce=nonce_counter,
+                timestamp_ms=ts_base,
+                payload=hop["payload"],
+                refs=hop["refs"],
+                trace_id=trace_id,
+                span_id=span_id,
+                hop_depth=hop["hop_depth"],
+                max_tokens=hop["max_tokens"],
+                max_micro_usd=hop["max_micro_usd"],
+            )
             t2 = time.perf_counter_ns()
-            _decoded = decode_frame(raw)
+
+            # Constant-time HMAC verify + decode timing
+            _verified = verify_frame(raw_signed, signing_key)
             t3 = time.perf_counter_ns()
-            summary = decompile_frame(raw)
+
+            # Two-phase policy reserve + settle timing
+            verdict = policy.evaluate_and_record(
+                raw_signed, signing_key=signing_key, now_ms=ts_base
+            )
+            assert verdict["allowed"] is True
+            _receipt = policy.settle_usage(trace_id, span_id, 250, 1_500)
             t4 = time.perf_counter_ns()
 
-            assert verdict["allowed"] is True
+            # Lossless decompile timing
+            summary = decompile_frame(raw_signed, signing_key=signing_key)
+            t5 = time.perf_counter_ns()
 
             encode_us_samples.append((t1 - t0) / 1000.0)
-            validate_us_samples.append((t2 - t1) / 1000.0)
-            decode_us_samples.append((t3 - t2) / 1000.0)
-            decompile_us_samples.append((t4 - t3) / 1000.0)
+            sign_us_samples.append((t2 - t1) / 1000.0)
+            verify_decode_us_samples.append((t3 - t2) / 1000.0)
+            reserve_settle_us_samples.append((t4 - t3) / 1000.0)
+            decompile_us_samples.append((t5 - t4) / 1000.0)
 
-            verbose_bytes_total += per_hop_verbose_bytes[hop_idx]
-            compact_json_bytes_total += per_hop_compact_bytes[hop_idx]
-            wire_bytes_total += len(raw)
+            b = per_hop_baselines[hop_idx]
+            ast_indented_json_bytes_total += b["ast_indented_bytes"]
+            ast_compact_json_bytes_total += b["ast_compact_bytes"]
+            ast_cbor_bytes_total += b["ast_cbor_bytes"]
+            aw_unsigned_bytes_total += len(raw_unsigned)
+            aw_signed_bytes_total += len(raw_signed)
 
-            verbose_tokens_total += per_hop_verbose_tokens[hop_idx]
-            wire_ast_tokens_total += estimator.count_text(summary["canonical_ast"])
+            verbose_envelope_tokens_total += b["verbose_env_tokens"]
+            minimal_ast_json_tokens_total += b["min_ctx_json_tokens"]
+            canonical_ast_tokens_total += estimator.count_text(summary["canonical_ast"])
 
-    # Measure deterministic guard-gate rejection of a rogue MUTATE from read-only researcher
-    rogue_raw = encode_ast(
+    # Guard-gate security timings: (a) unauthorized MUTATE, (b) replay attack
+    rogue_signed = sign_ast(
         source_agent="researcher",
         target_agent="coder",
         action="MUTATE",
         target="prod_db:invoices",
         intent="delete",
+        signing_key=signing_key,
+        nonce=999_999_001,
+        timestamp_ms=ts_base,
         payload={"table": "invoices", "strict": False},
         trace_id=9999,
         span_id=1,
         hop_depth=2,
+        guard_verified=True,  # Even with forged GUARD_VERIFIED flag!
     )
     t_r0 = time.perf_counter_ns()
-    rogue_verdict = policy.validate_frame(rogue_raw)
+    rogue_verdict = policy.validate_frame(rogue_signed, signing_key=signing_key, now_ms=ts_base)
     t_r1 = time.perf_counter_ns()
     rogue_block_us = (t_r1 - t_r0) / 1000.0
     assert rogue_verdict["allowed"] is False
+    assert rogue_verdict["reason_code"] == "UNAUTHORIZED_ACTION"
 
-    # Optionally export a realistic 6-event trace session (4 allowed hops + 2 blocked attacks) for the Dashboard
+    # Replay check on a previously accepted nonce
+    replay_signed = sign_ast(
+        source_agent="planner",
+        target_agent="researcher",
+        action="DELEGATE",
+        target="repo:billing",
+        intent="analyze_schema",
+        signing_key=signing_key,
+        nonce=nonce_counter - 3,  # Already recorded in last iteration!
+        timestamp_ms=ts_base,
+        trace_id=9998,
+        span_id=1,
+        hop_depth=1,
+    )
+    t_rp0 = time.perf_counter_ns()
+    replay_verdict = policy.validate_frame(replay_signed, signing_key=signing_key, now_ms=ts_base)
+    t_rp1 = time.perf_counter_ns()
+    replay_block_us = (t_rp1 - t_rp0) / 1000.0
+    assert replay_verdict["allowed"] is False
+    assert replay_verdict["reason_code"] == "REPLAY_DETECTED"
+
+    # Optional Dashboard trace export (6 frames: 4 allowed + 2 blocked)
+    export_summary = None
     if export_trace is not None:
         stream = TelemetryStream()
         client = WireClient(
@@ -390,6 +553,7 @@ def run_benchmark(iterations: int, export_trace: Path | None) -> dict[str, Any]:
             enable_safety_gate=True,
             raise_on_reject=False,
             token_estimator=estimator,
+            signing_key=signing_key,
         )
         for hop_idx, hop in enumerate(sample_hops):
             client.send(
@@ -405,9 +569,8 @@ def run_benchmark(iterations: int, export_trace: Path | None) -> dict[str, Any]:
                 hop_depth=hop["hop_depth"],
                 max_tokens=hop["max_tokens"],
                 max_micro_usd=hop["max_micro_usd"],
-                baseline_payload=hop["verbose_json"],
+                baseline_payload=hop["verbose_envelope"],
             )
-        # Blocked Event #5: read-only researcher attempts rogue MUTATE
         client.send(
             source_agent="researcher",
             target_agent="coder",
@@ -422,7 +585,6 @@ def run_benchmark(iterations: int, export_trace: Path | None) -> dict[str, Any]:
             max_tokens=1024,
             max_micro_usd=15_000,
         )
-        # Blocked Event #6: prompt-injection field smuggling attempt
         client.send(
             source_agent="planner",
             target_agent="coder",
@@ -441,23 +603,15 @@ def run_benchmark(iterations: int, export_trace: Path | None) -> dict[str, Any]:
         )
         stream.export_jsonl(export_trace)
         export_summary = stream.summary()
-    else:
-        export_summary = None
 
     total_hops = iterations * len(sample_hops)
-    byte_reduction_vs_verbose = (1.0 - wire_bytes_total / verbose_bytes_total) * 100.0
-    byte_reduction_vs_compact = (1.0 - wire_bytes_total / compact_json_bytes_total) * 100.0
-    token_reduction_pct = (1.0 - wire_ast_tokens_total / verbose_tokens_total) * 100.0
-
-    # Extrapolate USD savings per 100,000 multi-agent hops at $3.00 / 1M input tokens
-    price_per_1m = 3.0
-    avg_saved_tokens_per_hop = (verbose_tokens_total - wire_ast_tokens_total) / total_hops
-    usd_saved_per_100k_hops = (avg_saved_tokens_per_hop * 100_000 / 1_000_000.0) * price_per_1m
-
-    total_pipeline_us = [
-        e + v + d + dc
-        for e, v, d, dc in zip(
-            encode_us_samples, validate_us_samples, decode_us_samples, decompile_us_samples
+    full_auth_pipeline_us = [
+        s + v + p + d
+        for s, v, p, d in zip(
+            sign_us_samples,
+            verify_decode_us_samples,
+            reserve_settle_us_samples,
+            decompile_us_samples,
         )
     ]
 
@@ -465,84 +619,87 @@ def run_benchmark(iterations: int, export_trace: Path | None) -> dict[str, Any]:
         "iterations": iterations,
         "total_hops": total_hops,
         "tokenizer": estimator.backend_label,
-        "avg_verbose_json_bytes": verbose_bytes_total / total_hops,
-        "avg_compact_json_bytes": compact_json_bytes_total / total_hops,
-        "avg_agentwire_bytes": wire_bytes_total / total_hops,
-        "byte_reduction_vs_verbose_pct": byte_reduction_vs_verbose,
-        "byte_reduction_vs_compact_pct": byte_reduction_vs_compact,
-        "avg_verbose_tokens": verbose_tokens_total / total_hops,
-        "avg_agentwire_tokens": wire_ast_tokens_total / total_hops,
-        "token_reduction_pct": token_reduction_pct,
-        "usd_saved_per_100k_hops": usd_saved_per_100k_hops,
+        # Metric A (exact same struct wire bytes)
+        "avg_ast_indented_bytes": ast_indented_json_bytes_total / total_hops,
+        "avg_ast_compact_bytes": ast_compact_json_bytes_total / total_hops,
+        "avg_ast_cbor_bytes": ast_cbor_bytes_total / total_hops,
+        "avg_aw_unsigned_bytes": aw_unsigned_bytes_total / total_hops,
+        "avg_aw_signed_bytes": aw_signed_bytes_total / total_hops,
+        "aw_unsigned_vs_compact_json_pct": (1.0 - aw_unsigned_bytes_total / ast_compact_json_bytes_total) * 100.0,
+        "aw_unsigned_vs_cbor_pct": (1.0 - aw_unsigned_bytes_total / ast_cbor_bytes_total) * 100.0,
+        "aw_signed_vs_compact_json_pct": (1.0 - aw_signed_bytes_total / ast_compact_json_bytes_total) * 100.0,
+        # Metric B (LLM context tokens - cleanly separated from wire bytes)
+        "avg_verbose_env_tokens": verbose_envelope_tokens_total / total_hops,
+        "avg_min_ast_json_tokens": minimal_ast_json_tokens_total / total_hops,
+        "avg_canonical_ast_tokens": canonical_ast_tokens_total / total_hops,
+        "ast_vs_min_json_tok_pct": (1.0 - canonical_ast_tokens_total / minimal_ast_json_tokens_total) * 100.0,
+        "ast_vs_verbose_env_tok_pct": (1.0 - canonical_ast_tokens_total / verbose_envelope_tokens_total) * 100.0,
+        # Metric C (Rust + Crypto + Guard-Gate latencies)
         "encode_mean_us": statistics.fmean(encode_us_samples),
-        "encode_p99_us": percentile(encode_us_samples, 99),
-        "validate_mean_us": statistics.fmean(validate_us_samples),
-        "validate_p99_us": percentile(validate_us_samples, 99),
-        "decode_mean_us": statistics.fmean(decode_us_samples),
+        "sign_mean_us": statistics.fmean(sign_us_samples),
+        "sign_p99_us": percentile(sign_us_samples, 99),
+        "verify_decode_mean_us": statistics.fmean(verify_decode_us_samples),
+        "verify_decode_p99_us": percentile(verify_decode_us_samples, 99),
+        "reserve_settle_mean_us": statistics.fmean(reserve_settle_us_samples),
         "decompile_mean_us": statistics.fmean(decompile_us_samples),
-        "full_pipeline_mean_us": statistics.fmean(total_pipeline_us),
-        "full_pipeline_p99_us": percentile(total_pipeline_us, 99),
+        "full_auth_pipeline_mean_us": statistics.fmean(full_auth_pipeline_us),
+        "full_auth_pipeline_p99_us": percentile(full_auth_pipeline_us, 99),
         "rogue_block_us": rogue_block_us,
-        "rogue_reason_code": rogue_verdict["reason_code"],
-        "rogue_detail": rogue_verdict["detail"],
+        "replay_block_us": replay_block_us,
         "export_summary": export_summary,
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="AgentWire token & latency benchmark")
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=250,
-        help="Number of 4-hop workflow loops to benchmark (default: 250 = 1,000 hops)",
-    )
-    parser.add_argument(
-        "--export-trace",
-        type=Path,
-        default=None,
-        help="Optional path to export a 6-event sample trace JSONL for the dashboard",
-    )
+    parser = argparse.ArgumentParser(description="AgentWire v0.2.0 apples-to-apples benchmark")
+    parser.add_argument("--iterations", type=int, default=250)
+    parser.add_argument("--export-trace", type=Path, default=None)
     args = parser.parse_args()
 
     r = run_benchmark(iterations=args.iterations, export_trace=args.export_trace)
 
-    print("=" * 76)
-    print("  AgentWire (AW01) — Multi-Agent Wire Protocol & Guard-Gate Benchmark")
-    print("=" * 76)
-    print(f"  Workflow Simulated : planner -> researcher -> coder -> reviewer ({r['total_hops']} hops)")
-    print(f"  Tokenizer Backend  : {r['tokenizer']}")
-    print("-" * 76)
-    print("  1. PAYLOAD SIZE & TOKEN COMPRESSION (per hop average)")
-    print(f"     Verbose JSON (indented)  : {r['avg_verbose_json_bytes']:7.1f} B  |  {r['avg_verbose_tokens']:6.1f} tokens")
-    print(f"     Compact JSON (minified)  : {r['avg_compact_json_bytes']:7.1f} B")
-    print(f"     AgentWire Binary (AW01)  : {r['avg_agentwire_bytes']:7.1f} B  |  {r['avg_agentwire_tokens']:6.1f} tokens (canonical AST)")
-    print(f"     Byte Reduction (verbose) : {r['byte_reduction_vs_verbose_pct']:6.2f}%")
-    print(f"     Byte Reduction (compact) : {r['byte_reduction_vs_compact_pct']:6.2f}%")
-    print(f"     Token Reduction          : {r['token_reduction_pct']:6.2f}%")
-    print(f"     Est. USD Saved / 100k    : ${r['usd_saved_per_100k_hops']:,.2f}  (@ $3.00 / 1M input tokens)")
-    print("-" * 76)
-    print("  2. RUST CORE + PYO3 LATENCY (wall-clock perf_counter_ns)")
-    print(f"     Encode AST -> AW01       : mean {r['encode_mean_us']:6.2f} us  |  p99 {r['encode_p99_us']:6.2f} us")
-    print(f"     Policy Guard-Gate Check  : mean {r['validate_mean_us']:6.2f} us  |  p99 {r['validate_p99_us']:6.2f} us")
-    print(f"     Decode + CRC32 Verify    : mean {r['decode_mean_us']:6.2f} us")
-    print(f"     Lossless AST Decompile   : mean {r['decompile_mean_us']:6.2f} us")
-    print(f"     Full Roundtrip Pipeline  : mean {r['full_pipeline_mean_us']:6.2f} us  |  p99 {r['full_pipeline_p99_us']:6.2f} us")
-    print("-" * 76)
-    print("  3. DETERMINISTIC SAFETY GUARD-GATE (Zero Downstream API Cost)")
-    print(f"     Test Case                : researcher -> MUTATE prod_db:invoices::delete")
-    print(f"     Verdict                  : REJECTED [{r['rogue_reason_code']}] in {r['rogue_block_us']:.2f} us")
-    print(f"     Detail                   : {r['rogue_detail']}")
-    if args.export_trace is not None:
+    print("=" * 80)
+    print("  AgentWire v0.2.0 (AW01) — Apples-to-Apples Wire, Token & Security Benchmark")
+    print("=" * 80)
+    print(f"  Workload  : planner -> researcher -> coder -> reviewer ({r['total_hops']} hops)")
+    print(f"  Tokenizer : {r['tokenizer']}")
+    print("-" * 80)
+    print("  A. WIRE SERIALIZATION BYTES (EXACT SAME SEMANTIC AST STRUCT)")
+    print(f"     Indented JSON (same AST)   : {r['avg_ast_indented_bytes']:7.1f} B")
+    print(f"     Compact JSON  (same AST)   : {r['avg_ast_compact_bytes']:7.1f} B")
+    print(f"     RFC 8949 CBOR (same AST)   : {r['avg_ast_cbor_bytes']:7.1f} B")
+    print(f"     AgentWire AW01 (unsigned)  : {r['avg_aw_unsigned_bytes']:7.1f} B  "
+          f"(-{r['aw_unsigned_vs_compact_json_pct']:.1f}% vs compact JSON, -{r['aw_unsigned_vs_cbor_pct']:.1f}% vs CBOR)")
+    print(f"     AgentWire AW01 (HMAC-256)  : {r['avg_aw_signed_bytes']:7.1f} B  "
+          f"(-{r['aw_signed_vs_compact_json_pct']:.1f}% vs compact JSON; incl. 32B MAC + nonce/ts)")
+    print("-" * 80)
+    print("  B. LLM INPUT CONTEXT TOKENS (SEPARATE FROM WIRE BYTES)")
+    print("     Note: Binary wire compression alone does not reduce LLM API tokens; savings")
+    print("     apply when receivers inject the decompiled Canonical AST into model context.")
+    print(f"     Minimal Compact AST JSON   : {r['avg_min_ast_json_tokens']:6.1f} tokens/hop")
+    print(f"     AgentWire Canonical AST    : {r['avg_canonical_ast_tokens']:6.1f} tokens/hop  "
+          f"(-{r['ast_vs_min_json_tok_pct']:.1f}% vs minimal AST JSON)")
+    print(f"     Verbose Framework Envelope : {r['avg_verbose_env_tokens']:6.1f} tokens/hop  "
+          f"(-{r['ast_vs_verbose_env_tok_pct']:.1f}% when replacing full prompt/JSON handoffs)")
+    print("-" * 80)
+    print("  C. RUST CORE + HMAC-SHA256 + TWO-PHASE GUARD-GATE LATENCY (perf_counter_ns)")
+    print(f"     Encode AW01 (unsigned)     : mean {r['encode_mean_us']:6.2f} us")
+    print(f"     Sign AW01 (HMAC-SHA256)    : mean {r['sign_mean_us']:6.2f} us  |  p99 {r['sign_p99_us']:6.2f} us")
+    print(f"     Verify HMAC + Decode/CRC32 : mean {r['verify_decode_mean_us']:6.2f} us  |  p99 {r['verify_decode_p99_us']:6.2f} us")
+    print(f"     Policy Reserve + Settle    : mean {r['reserve_settle_mean_us']:6.2f} us")
+    print(f"     Lossless AST Decompile     : mean {r['decompile_mean_us']:6.2f} us")
+    print(f"     Full Authenticated Pipeline: mean {r['full_auth_pipeline_mean_us']:6.2f} us  |  p99 {r['full_auth_pipeline_p99_us']:6.2f} us")
+    print(f"     Forged Rogue MUTATE Block  : {r['rogue_block_us']:6.2f} us (UNAUTHORIZED_ACTION)")
+    print(f"     Replay Attack Block        : {r['replay_block_us']:6.2f} us (REPLAY_DETECTED)")
+    if args.export_trace is not None and r["export_summary"]:
         es = r["export_summary"]
-        print("-" * 76)
-        print(f"  Exported Dashboard Trace   : {args.export_trace}")
-        if es:
-            print(
-                f"  Trace Capture Summary      : {es['allowed_frames']} ok / {es['rejected_frames']} blocked | "
-                f"Bytes -{es['byte_reduction_pct']:.1f}% | Tokens -{es['token_reduction_pct']:.1f}%"
-            )
-    print("=" * 76)
+        print("-" * 80)
+        print(f"  Exported Dashboard Trace     : {args.export_trace}")
+        print(
+            f"  Trace Capture Summary        : {es['allowed_frames']} ok / {es['rejected_frames']} blocked | "
+            f"Bytes -{es['byte_reduction_pct']:.1f}% | Tokens -{es['token_reduction_pct']:.1f}%"
+        )
+    print("=" * 80)
 
 
 if __name__ == "__main__":
