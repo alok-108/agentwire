@@ -1,4 +1,4 @@
-# AgentWire (`AW01` v0.2.1)
+# AgentWire (`AW01` v0.3.0)
 
 [![Rust 2021](https://img.shields.io/badge/Rust-2021-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -255,7 +255,7 @@ If you use **AgentWire** (`swarmwire`) in academic work, benchmarks, or producti
   author  = {Pandey, Alok},
   title   = {{AgentWire (swarmwire): Compact Binary Wire Protocol and Verifiable Policy Runtime for Multi-Agent AI Systems}},
   year    = {2026},
-  version = {0.2.1},
+  version = {0.3.0},
   url     = {https://github.com/alok-108/agentwire}
 }
 ```

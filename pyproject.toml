@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "swarmwire"
-version = "0.2.1"
+version = "0.3.0"
 description = "A compact, cryptographically verifiable binary wire protocol and deterministic policy runtime for multi-agent AI systems."
 readme = "README.md"
 license = { text = "Apache-2.0" }
