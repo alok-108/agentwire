@@ -5,7 +5,7 @@
 [![PyPI](https://img.shields.io/pypi/v/swarmwire?color=3776AB&logo=pypi&logoColor=white)](https://pypi.org/project/swarmwire/)
 [![AgentWire CI](https://github.com/alok-108/agentwire/actions/workflows/ci.yml/badge.svg)](https://github.com/alok-108/agentwire/actions/workflows/ci.yml)
 [![Release v0.2.0](https://img.shields.io/github/v/release/alok-108/agentwire?color=06b6d4)](https://github.com/alok-108/agentwire/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 > **A compact, cryptographically verifiable binary wire protocol and deterministic policy runtime for multi-agent AI systems.**
 > Combines a typed Semantic AST (`AW01`), constant-time HMAC-SHA256 frame authentication with replay protection, two-phase Reserve/Settle budget accounting, a networked TCP RPC transport, and a 1:1 lossless live trace decompiler.
@@ -262,4 +262,6 @@ If you use **AgentWire** (`swarmwire`) in academic work, benchmarks, or producti
 
 ## License
 
-Licensed under the [MIT License](LICENSE) — Copyright (c) 2026 Alok Pandey.
+Licensed under the [Apache License, Version 2.0](LICENSE) (see [NOTICE](NOTICE)) — Copyright 2026 Alok Pandey.
+
+> **Note:** Prior published releases (`v0.2.0` and `v0.2.1`) remain licensed under the MIT License; Apache-2.0 applies going forward from this change.
