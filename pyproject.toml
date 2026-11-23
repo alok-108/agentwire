@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "AGENT-WIRE"
+name = "swarmwire"
 version = "0.2.0"
 description = "A compact, cryptographically verifiable binary wire protocol and deterministic policy runtime for multi-agent AI systems."
 readme = "README.md"
