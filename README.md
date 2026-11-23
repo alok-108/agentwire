@@ -2,7 +2,7 @@
 
 [![Rust 2021](https://img.shields.io/badge/Rust-2021-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![PyPI](https://img.shields.io/pypi/v/agentwire-rpc?color=3776AB&logo=pypi&logoColor=white)](https://pypi.org/project/agentwire-rpc/)
+[![PyPI](https://img.shields.io/pypi/v/AGENT-WIRE?color=3776AB&logo=pypi&logoColor=white)](https://pypi.org/project/AGENT-WIRE/)
 [![AgentWire CI](https://github.com/alok-108/agentwire/actions/workflows/ci.yml/badge.svg)](https://github.com/alok-108/agentwire/actions/workflows/ci.yml)
 [![Release v0.2.0](https://img.shields.io/github/v/release/alok-108/agentwire?color=06b6d4)](https://github.com/alok-108/agentwire/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg)](LICENSE)
@@ -108,10 +108,10 @@ python benchmarks/token_latency_bench.py --iterations 250 --export-trace dashboa
 ### Installation
 
 ```bash
-pip install agentwire-rpc
+pip install AGENT-WIRE
 ```
 
-> The PyPI distribution is published as **`agentwire-rpc`** and imports cleanly in Python as **`import agentwire`**.
+> The PyPI distribution is published as **`AGENT-WIRE`** and imports cleanly in Python as **`import agentwire`**.
 
 ### 1. Networked Authenticated TCP RPC Server & Client
 
