@@ -1,4 +1,4 @@
-# AgentWire (`AW01` v0.2.0)
+# AgentWire (`AW01` v0.2.1)
 
 [![Rust 2021](https://img.shields.io/badge/Rust-2021-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
