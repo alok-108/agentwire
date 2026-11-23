@@ -1,0 +1,66 @@
+name: AgentWire CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  rust-and-python:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Cargo workspace tests
+        run: cargo test --workspace
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Build PyO3 extension & run pytest + benchmark
+        shell: bash
+        run: |
+          uv venv .venv
+          if [ -f .venv/Scripts/python.exe ]; then
+            PY=.venv/Scripts/python.exe
+            MATURIN=.venv/Scripts/maturin.exe
+            PYTEST=.venv/Scripts/pytest.exe
+          else
+            PY=.venv/bin/python
+            MATURIN=.venv/bin/maturin
+            PYTEST=.venv/bin/pytest
+          fi
+          uv pip install --python "$PY" maturin pytest tiktoken
+          "$MATURIN" develop --release
+          "$PYTEST"
+          "$PY" benchmarks/token_latency_bench.py --iterations 100
+
+  dashboard-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install & build React dashboard
+        run: |
+          npm install
+          npm run build

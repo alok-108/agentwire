@@ -1,0 +1,13 @@
+[package]
+name = "agentwire-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core AST, binary wire codec, and lossless decompiler for AgentWire."
+
+[dependencies]
+crc32fast.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

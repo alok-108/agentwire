@@ -1,0 +1,30 @@
+export interface TraceEvent {
+  timestamp_ms: number;
+  trace_id: number;
+  span_id: number;
+  hop_depth: number;
+  source_agent: string;
+  target_agent: string;
+  action: "QUERY" | "MUTATE" | "DELEGATE" | "YIELD" | "ASSERT" | string;
+  target: string;
+  intent: string;
+  allowed: boolean;
+  reason_code: string | null;
+  detail: string | null;
+  wire_bytes: number;
+  baseline_bytes: number;
+  wire_tokens: number;
+  baseline_tokens: number;
+  encode_us: number;
+  validate_us: number;
+  decompile_us: number;
+  raw_hex: string;
+  human_readable: string;
+  canonical_ast: string;
+  structured_lines: string[];
+  budget_tokens: number;
+  budget_usd: number;
+  tokenizer: string;
+  byte_reduction_pct?: number;
+  token_reduction_pct?: number;
+}
