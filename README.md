@@ -241,3 +241,25 @@ cd dashboard && npm install && npm run dev
 # Terminal 2: Stream live LangGraphWire + CrewAIWire traces over SSE (http://127.0.0.1:8765/api/stream)
 .venv/Scripts/python.exe examples/live_langgraph_crewai_demo.py --keep-alive 0
 ```
+
+---
+
+## Author & Citation
+
+Created and maintained by **Alok Pandey** ([@alok-108](https://github.com/alok-108)).
+
+If you use **AgentWire** (`swarmwire`) in academic work, benchmarks, or production systems, you can cite it via GitHub's **"Cite this repository"** button ([CITATION.cff](CITATION.cff)) or the BibTeX entry below:
+
+```bibtex
+@software{pandey2026agentwire,
+  author  = {Pandey, Alok},
+  title   = {{AgentWire (swarmwire): Compact Binary Wire Protocol and Verifiable Policy Runtime for Multi-Agent AI Systems}},
+  year    = {2026},
+  version = {0.2.1},
+  url     = {https://github.com/alok-108/agentwire}
+}
+```
+
+## License
+
+Licensed under the [MIT License](LICENSE) — Copyright (c) 2026 Alok Pandey.
