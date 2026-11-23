@@ -73,7 +73,7 @@ def main() -> None:
         raw_client = AgentWireRpcClient(host, port, signing_key=SHARED_HMAC_KEY)
         forged_mutate = sign_ast(
             source_agent="researcher",
-            target_agent="researcher",
+            target_agent="coder",
             action="MUTATE",
             target="prod_db:invoices",
             intent="delete",
@@ -94,7 +94,7 @@ def main() -> None:
         try:
             crew.dispatch_task(
                 from_role="researcher",
-                to_role="researcher",
+                to_role="coder",
                 action="MUTATE",
                 target="prod_db:invoices",
                 intent="delete",
