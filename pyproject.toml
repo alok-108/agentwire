@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "swarmwire"
-version = "0.3.0"
+version = "0.3.1"
 description = "A compact, cryptographically verifiable binary wire protocol and deterministic policy runtime for multi-agent AI systems."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -56,6 +56,7 @@ Changelog = "https://github.com/alok-108/agentwire/releases"
 [tool.maturin]
 manifest-path = "crates/agentwire-py/Cargo.toml"
 python-source = "python"
+python-packages = ["agentwire", "swarmwire"]
 module-name = "agentwire._agentwire"
 features = ["extension-module"]
 include = [

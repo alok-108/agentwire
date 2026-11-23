@@ -24,6 +24,25 @@ def test_protocol_metadata() -> None:
     assert 50 <= info["static_dict_size"] <= 127
 
 
+def test_swarmwire_top_level_import_alias() -> None:
+    import swarmwire
+    from swarmwire.adapters import CrewAIWire as SwCrewAIWire, LangGraphWire as SwLangGraphWire
+    from swarmwire.telemetry import TelemetryStream as SwTelemetryStream
+    from swarmwire.transport import AgentWireRpcClient as SwRpcClient, AgentWireRpcServer as SwRpcServer
+
+    assert swarmwire.__version__ == agentwire.__version__
+    assert swarmwire.encode_ast is agentwire.encode_ast
+    assert swarmwire.WireClient is agentwire.WireClient
+    assert SwLangGraphWire is agentwire.LangGraphWire
+    assert SwCrewAIWire is agentwire.CrewAIWire
+    assert SwTelemetryStream is agentwire.TelemetryStream
+    assert SwRpcServer is agentwire.AgentWireRpcServer
+    assert SwRpcClient is agentwire.AgentWireRpcClient
+
+    raw = swarmwire.encode_ast("planner", "researcher", "QUERY", "docs:api", "search")
+    assert swarmwire.decode_frame(raw)["body"]["action"] == "QUERY"
+
+
 @pytest.mark.parametrize("action", ["QUERY", "MUTATE", "DELEGATE", "YIELD", "ASSERT"])
 def test_roundtrip_all_actions(action: str) -> None:
     raw = encode_ast(

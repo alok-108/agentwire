@@ -1,4 +1,4 @@
-# AgentWire (`AW01` v0.3.0)
+# AgentWire (`AW01` v0.3.1)
 
 [![Rust 2021](https://img.shields.io/badge/Rust-2021-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -112,12 +112,12 @@ python benchmarks/token_latency_bench.py --iterations 250 --export-trace dashboa
 pip install swarmwire
 ```
 
-> The PyPI distribution is published as **`swarmwire`** and imports cleanly in Python as **`import agentwire`**.
+> Supports both **`import swarmwire`** and **`import agentwire`** interchangeably.
 
 ### 1. Networked Authenticated TCP RPC Server & Client
 
 ```python
-from agentwire import AgentWireRpcClient, AgentWireRpcServer
+from swarmwire import AgentWireRpcClient, AgentWireRpcServer
 
 KEY = b"replace-with-32-byte-secret-key!"
 
@@ -149,7 +149,7 @@ with AgentWireRpcServer(signing_key=KEY) as server:
 ### 2. Two-Phase Budget Reserve, Settle & Release
 
 ```python
-from agentwire import WireClient
+from swarmwire import WireClient
 
 client = WireClient(signing_key=b"replace-with-32-byte-secret-key!")
 
@@ -172,7 +172,7 @@ print(f"Released {receipt['released_tokens']} unused tokens back to session pool
 ### 3. LangGraph & CrewAI Drop-In Adapters (Local or Remote TCP)
 
 ```python
-from agentwire.adapters import CrewAIWire, LangGraphWire
+from swarmwire.adapters import CrewAIWire, LangGraphWire
 
 # LangGraph state serializer middleware
 lg = LangGraphWire(enable_safety_gate=True)
