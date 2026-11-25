@@ -1,0 +1,45 @@
+syntax = "proto3";
+package agentwire.benchmark;
+
+// Logical frame used by hop_to_equivalent_ast_struct, without authentication.
+message WireFrame {
+  uint32 v = 1;
+  uint64 trace_id = 2;
+  uint32 span_id = 3;
+  uint32 hop_depth = 4;
+  string source_agent = 5;
+  string target_agent = 6;
+  uint32 max_tokens = 7;
+  uint64 max_micro_usd = 8;
+  Action action = 9;
+  string target = 10;
+  string intent = 11;
+  map<string, Value> payload = 12;
+  repeated string refs = 13;
+}
+
+enum Action {
+  ACTION_UNSPECIFIED = 0;
+  QUERY = 1;
+  MUTATE = 2;
+  DELEGATE = 3;
+  YIELD = 4;
+  ASSERT = 5;
+}
+
+// google.protobuf.Struct stores all numbers as doubles; AW01 distinguishes
+// signed 64-bit integers from floating-point values.
+message Value {
+  oneof kind {
+    bool null_value = 1;
+    bool boolean = 2;
+    sint64 integer = 3;
+    double floating = 4;
+    string text = 5;
+    Sequence sequence = 6;
+    Mapping mapping = 7;
+    string ref = 8;
+  }
+}
+message Sequence { repeated Value values = 1; }
+message Mapping { map<string, Value> fields = 1; }

@@ -39,6 +39,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+benchmark = ["protobuf>=5", "msgpack>=1", "cbor2>=5"]
 dev = [
     "maturin>=1.7,<2.0",
     "pytest>=8.0",
@@ -66,5 +67,6 @@ include = [
 ]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-v"

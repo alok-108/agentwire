@@ -28,6 +28,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .comparison_codecs import optional_codecs
+else:
+    from comparison_codecs import optional_codecs
+
 from agentwire import (
     PolicyEngine,
     TelemetryStream,
@@ -378,10 +383,24 @@ def run_benchmark(iterations: int, export_trace: Path | None) -> dict[str, Any]:
 
     # Metric A: Exact same semantic struct wire bytes
     ast_indented_json_bytes_total = 0
-    ast_compact_json_bytes_total = 0
-    ast_cbor_bytes_total = 0
     aw_unsigned_bytes_total = 0
     aw_signed_bytes_total = 0
+
+    codecs = optional_codecs()
+    codecs["Compact JSON"] = (
+        lambda frame: json.dumps(frame, ensure_ascii=False, separators=(",", ":")).encode(),
+        json.loads,
+    )
+    try:
+        from cbor2 import loads as decode_cbor
+    except ModuleNotFoundError as exc:
+        if exc.name != "cbor2":
+            raise
+        decode_cbor = None
+    codecs["CBOR"] = (encode_cbor, decode_cbor)
+    # Accumulate ns across actual frames (trace_id changes each iteration).
+    measurements = {name: [0, 0, 0] for name in codecs}
+    unsigned_decode_ns = 0
 
     # Metric B: LLM input context tokens (separated cleanly from wire bytes)
     verbose_envelope_tokens_total = 0
@@ -400,12 +419,7 @@ def run_benchmark(iterations: int, export_trace: Path | None) -> dict[str, Any]:
 
     # Pre-compute deterministic baselines for the 4 hops
     per_hop_baselines: list[dict[str, int]] = []
-    for hop_idx, hop in enumerate(sample_hops):
-        eq_struct = hop_to_equivalent_ast_struct(hop, trace_id=2000, span_id=hop_idx + 1)
-        eq_indented = json.dumps(eq_struct, ensure_ascii=False, indent=2)
-        eq_compact = json.dumps(eq_struct, ensure_ascii=False, separators=(",", ":"))
-        eq_cbor = encode_cbor(eq_struct)
-
+    for hop in sample_hops:
         min_ctx_json = json.dumps(
             hop_to_minimal_context_json(hop), ensure_ascii=False, separators=(",", ":")
         )
@@ -413,9 +427,6 @@ def run_benchmark(iterations: int, export_trace: Path | None) -> dict[str, Any]:
 
         per_hop_baselines.append(
             {
-                "ast_indented_bytes": len(eq_indented.encode("utf-8")),
-                "ast_compact_bytes": len(eq_compact.encode("utf-8")),
-                "ast_cbor_bytes": len(eq_cbor),
                 "verbose_env_tokens": estimator.count_text(verbose_env),
                 "min_ctx_json_tokens": estimator.count_text(min_ctx_json),
             }
@@ -489,10 +500,22 @@ def run_benchmark(iterations: int, export_trace: Path | None) -> dict[str, Any]:
             reserve_settle_us_samples.append((t4 - t3) / 1000.0)
             decompile_us_samples.append((t5 - t4) / 1000.0)
 
+            start = time.perf_counter_ns()
+            decode_frame(raw_unsigned)
+            unsigned_decode_ns += time.perf_counter_ns() - start
+            frame = hop_to_equivalent_ast_struct(hop, trace_id, span_id)
+            ast_indented_json_bytes_total += len(json.dumps(frame, ensure_ascii=False, indent=2).encode())
+            for name, (encode, decode) in codecs.items():
+                start = time.perf_counter_ns()
+                data = encode(frame)
+                encoded_at = time.perf_counter_ns()
+                if decode is not None:
+                    decode(data)
+                    measurements[name][2] += time.perf_counter_ns() - encoded_at
+                measurements[name][0] += len(data)
+                measurements[name][1] += encoded_at - start
+
             b = per_hop_baselines[hop_idx]
-            ast_indented_json_bytes_total += b["ast_indented_bytes"]
-            ast_compact_json_bytes_total += b["ast_compact_bytes"]
-            ast_cbor_bytes_total += b["ast_cbor_bytes"]
             aw_unsigned_bytes_total += len(raw_unsigned)
             aw_signed_bytes_total += len(raw_signed)
 
@@ -615,7 +638,15 @@ def run_benchmark(iterations: int, export_trace: Path | None) -> dict[str, Any]:
         )
     ]
 
+    ast_compact_json_bytes_total = measurements["Compact JSON"][0]
+    ast_cbor_bytes_total = measurements["CBOR"][0]
     return {
+        "wire_comparison": {
+            name: (size / total_hops, enc / total_hops / 1000,
+                   dec / total_hops / 1000 if codecs[name][1] else None)
+            for name, (size, enc, dec) in measurements.items()
+        },
+        "unsigned_decode_mean_us": unsigned_decode_ns / total_hops / 1000,
         "iterations": iterations,
         "total_hops": total_hops,
         "tokenizer": estimator.backend_label,
@@ -672,6 +703,16 @@ def main() -> None:
           f"(-{r['aw_unsigned_vs_compact_json_pct']:.1f}% vs compact JSON, -{r['aw_unsigned_vs_cbor_pct']:.1f}% vs CBOR)")
     print(f"     AgentWire AW01 (HMAC-256)  : {r['avg_aw_signed_bytes']:7.1f} B  "
           f"(-{r['aw_signed_vs_compact_json_pct']:.1f}% vs compact JSON; incl. 32B MAC + nonce/ts)")
+    print("     Format                 Bytes/hop   Encode us   Decode us (mean)")
+    rows = dict(r["wire_comparison"])
+    rows["AW01 (unsigned)"] = (r["avg_aw_unsigned_bytes"], r["encode_mean_us"], r["unsigned_decode_mean_us"])
+    rows["AW01 (authenticated)"] = (r["avg_aw_signed_bytes"], r["sign_mean_us"], r["verify_decode_mean_us"])
+    for name, (size, enc, dec) in rows.items():
+        decode_time = f"{dec:.2f}" if dec is not None else "n/a"
+        print(f"     {name:22s} {size:9.1f} {enc:11.2f} {decode_time:>11s}")
+    for name in ("MessagePack", "Protobuf"):
+        if name not in rows:
+            print(f"     {name}: skipped (optional dependency not installed)")
     print("-" * 80)
     print("  B. LLM INPUT CONTEXT TOKENS (SEPARATE FROM WIRE BYTES)")
     print("     Note: Binary wire compression alone does not reduce LLM API tokens; savings")
