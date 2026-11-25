@@ -80,6 +80,32 @@ python benchmarks/token_latency_bench.py --iterations 250 --export-trace dashboa
 | **AgentWire `AW01` (Unsigned + CRC32)** | **115.2 B** | **-68.3%** | **-60.7%** |
 | **AgentWire `AW01` (HMAC-SHA256 + Nonce/TS + CRC32)** | **155.1 B** | **-57.4%** | **-47.1%** |
 
+#### Codec timings on the same frames
+
+Install the optional codecs with `python -m pip install '.[benchmark]'` and run
+`python benchmarks/token_latency_bench.py --iterations 250`. The benchmark
+skips an unavailable Protobuf or MessagePack codec independently. Without
+`cbor2`, it still reports CBOR size and encoding time.
+
+| Format | Mean bytes/hop | Mean encode (µs) | Mean decode (µs) |
+| --- | ---: | ---: | ---: |
+| Compact JSON (UTF-8) | 364.0 | 4.81 | 4.68 |
+| CBOR | 293.0 | 15.02 | 4.05 |
+| MessagePack | 292.2 | 2.18 | 2.51 |
+| Protobuf | 211.5 | 7.71 | 1.53 |
+| AW01 unsigned | 115.2 | 3.10 | 2.67 |
+| AW01 authenticated | 155.1 | 2.70 | 3.60 |
+
+This Windows CPython 3.12 run used 1,000 hops and the v0.4.0 release wheel.
+Encoding starts from the Python frame fields and includes Protobuf message
+construction. Decoding ends at the codec's native result (a message for
+Protobuf). Authenticated AW01 includes signing and verification. These are
+local serialization timings and exclude network and inference time.
+
+The Protobuf schema is [wire_frame.proto](benchmarks/wire_frame.proto). To
+regenerate its runtime descriptor, run
+`protoc -I benchmarks --descriptor_set_out=benchmarks/wire_frame.desc benchmarks/wire_frame.proto`.
+
 ### B. LLM Input Context Tokens (`tiktoken:cl100k_base`)
 
 > **Methodology note:** Binary wire compression alone does **not** reduce tokens billed by an LLM API. Token reductions apply only when the receiving application injects AgentWire's decompiled **Canonical AST** into model context instead of JSON/prompt boilerplate. Both baselines are reported separately below:
